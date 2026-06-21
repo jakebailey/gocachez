@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOLANGCI_LINT_VERSION: v2.12.2
+
 defaults:
   run:
     shell: bash
@@ -51,7 +54,7 @@ jobs:
       - uses: dprint/check@9cb3a2b17a8e606d37aae341e49df3654933fc23 # v2.3
       - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
         with:
-          version: v2.12.2
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
 
   smoke:
     name: smoke (${{ matrix.os }})
@@ -77,13 +80,15 @@ jobs:
           export GOBIN="$RUNNER_TEMP/bin"
           mkdir -p "$GOBIN"
           go install .
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
           export PATH="$GOBIN:$PATH"
-          export GOCACHE="$RUNNER_TEMP/go-build"
-          export GOCACHEPROG=gocachez
           export GOCACHEZ_DIR="$RUNNER_TEMP/gocachez"
+          go env -w GOCACHE="$RUNNER_TEMP/go-build"
+          go env -w GOCACHEPROG=gocachez
           go test -run '^$' -count=1 std cmd
-          golangci-lint run
+
+      - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
 
   required:
     runs-on: ubuntu-latest
