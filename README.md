@@ -10,19 +10,19 @@ This project was inspired by the discussion on
 
 Go `std`:
 
-| Mode             |        Cold time |       Warm time | Disk usage |
-| ---------------- | ---------------: | --------------: | ---------: |
-| No `GOCACHEPROG` |           37.79s |           3.81s |     1.60GB |
-| `gocachez`       |           48.52s |           5.29s |      403MB |
-|                  | +10.73s (+28.4%) | +1.48s (+38.8%) |     -74.8% |
+| Mode             |       Cold time |       Warm time | Disk usage |
+| ---------------- | --------------: | --------------: | ---------: |
+| No `GOCACHEPROG` |          36.31s |           4.06s |     1.60GB |
+| `gocachez`       |          40.97s |           5.65s |      403MB |
+|                  | +4.66s (+12.8%) | +1.59s (+39.1%) |     -74.8% |
 
 [`typescript-go`](https://github.com/microsoft/typescript-go):
 
-| Mode             |       Cold time |       Warm time | Disk usage |
-| ---------------- | --------------: | --------------: | ---------: |
-| No `GOCACHEPROG` |          81.49s |           4.57s |     4.95GB |
-| `gocachez`       |          89.92s |           6.77s |      453MB |
-|                  | +8.43s (+10.3%) | +2.20s (+48.1%) |     -90.9% |
+| Mode             |      Cold time |       Warm time | Disk usage |
+| ---------------- | -------------: | --------------: | ---------: |
+| No `GOCACHEPROG` |         89.20s |           4.76s |     4.95GB |
+| `gocachez`       |         96.84s |           6.97s |      453MB |
+|                  | +7.64s (+8.6%) | +2.21s (+46.4%) |     -90.9% |
 
 ## Installation
 
