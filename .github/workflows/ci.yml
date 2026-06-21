@@ -77,11 +77,13 @@ jobs:
           export GOBIN="$RUNNER_TEMP/bin"
           mkdir -p "$GOBIN"
           go install .
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
           export PATH="$GOBIN:$PATH"
           export GOCACHE="$RUNNER_TEMP/go-build"
           export GOCACHEPROG=gocachez
           export GOCACHEZ_DIR="$RUNNER_TEMP/gocachez"
           go test -run '^$' -count=1 std cmd
+          golangci-lint run
 
   required:
     runs-on: ubuntu-latest
