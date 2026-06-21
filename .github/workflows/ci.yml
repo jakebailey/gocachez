@@ -14,6 +14,8 @@ permissions:
 env:
   GOLANGCI_LINT_VERSION: v2.12.2
 
+# Ensure scripts are run with pipefail. See:
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#exit-codes-and-error-action-preference
 defaults:
   run:
     shell: bash
@@ -42,8 +44,8 @@ jobs:
       - run: git add .
       - run: git diff --staged --exit-code
 
-  lint:
-    name: lint
+  format:
+    name: format
     runs-on: ubuntu-latest
 
     steps:
@@ -52,9 +54,6 @@ jobs:
         with:
           go-version: stable
       - uses: dprint/check@9cb3a2b17a8e606d37aae341e49df3654933fc23 # v2.3
-      - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
-        with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
 
   smoke:
     name: smoke (${{ matrix.os }})
@@ -75,8 +74,6 @@ jobs:
 
       - name: Configure GOCACHEPROG
         run: |
-          set -euo pipefail
-
           export GOBIN="$RUNNER_TEMP/bin"
           mkdir -p "$GOBIN"
           go install .
@@ -87,8 +84,6 @@ jobs:
 
       - name: Smoke test std and cmd
         run: |
-          set -euo pipefail
-
           go test -run '^$' -count=1 std cmd
 
       - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
@@ -99,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ always() }}
     needs:
-      - lint
+      - format
       - smoke
       - test
 
