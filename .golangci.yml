@@ -1,0 +1,33 @@
+version: '2'
+
+linters:
+  default: all
+  disable:
+    - cyclop
+    - depguard
+    - err113
+    - exhaustive
+    - exhaustruct
+    - funlen
+    - gochecknoglobals
+    - gocognit
+    - goconst
+    - gocyclo
+    - gomodguard
+    - gosec
+    - lll
+    - maintidx
+    - mnd
+    - modernize
+    - musttag
+    - nestif
+    - nlreturn
+    - noinlineerr
+    - paralleltest
+    - revive
+    - tagliatelle
+    - testpackage
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5

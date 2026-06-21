@@ -1,0 +1,24 @@
+{
+    "[go]": {
+        "editor.defaultFormatter": "dprint.dprint",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        }
+    },
+    "[go.mod][go.sum][go.work]": {
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "editor.defaultFormatter": "golang.go",
+        "editor.formatOnSave": true,
+        "editor.insertSpaces": false
+    },
+    "[json][jsonc][yaml][github-actions-workflow][markdown]": {
+        "editor.defaultFormatter": "dprint.dprint",
+        "editor.formatOnSave": true
+    },
+    "gopls": {
+        "formatting.gofumpt": true
+    },
+    "go.lintOnSave": "off"
+}
