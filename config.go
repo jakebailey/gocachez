@@ -20,8 +20,8 @@ type config struct {
 }
 
 type fileConfig struct {
-	CacheDir *string `json:"cache_dir"`
-	MaxSize  *string `json:"max_size"`
+	CacheDir *string `json:"cacheDir"`
+	MaxSize  *string `json:"maxSize"`
 	Verbose  *bool   `json:"verbose"`
 }
 
@@ -143,7 +143,7 @@ func applyFileConfig(cfg *config, fc fileConfig) error {
 	if fc.MaxSize != nil {
 		maxSize, err := parseSize(*fc.MaxSize)
 		if err != nil {
-			return fmt.Errorf("parse config max_size: %w", err)
+			return fmt.Errorf("parse config maxSize: %w", err)
 		}
 		cfg.maxSize = maxSize
 	}

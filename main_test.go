@@ -1289,8 +1289,8 @@ func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
 	}
 	configPath := filepath.Join(configDir, "config.json")
 	configJSON := `{
-		"cache_dir": ` + strconvQuote(cacheDir) + `,
-		"max_size": "123MiB",
+		"cacheDir": ` + strconvQuote(cacheDir) + `,
+		"maxSize": "123MiB",
 		"verbose": true
 	}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
@@ -1343,7 +1343,7 @@ func TestParseFlagsOverrideConfigFile(t *testing.T) {
 	configPath := filepath.Join(configDir, "config.json")
 	configCacheDir := filepath.Join(configDir, "config-cache")
 	flagCacheDir := filepath.Join(configDir, "flag-cache")
-	configJSON := `{"cache_dir": ` + strconvQuote(configCacheDir) + `, "max_size": "10MiB"}`
+	configJSON := `{"cacheDir": ` + strconvQuote(configCacheDir) + `, "maxSize": "10MiB"}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
 		t.Fatal(err)
 	}
@@ -1424,11 +1424,11 @@ func TestApplyConfigFileRejectsInvalidJSONAndSize(t *testing.T) {
 	}
 
 	badSize := filepath.Join(dir, "bad-size.json")
-	if err := os.WriteFile(badSize, []byte(`{"max_size":"wat"}`), 0o666); err != nil {
+	if err := os.WriteFile(badSize, []byte(`{"maxSize":"wat"}`), 0o666); err != nil {
 		t.Fatal(err)
 	}
 	if err := applyConfigFile(&cfg, badSize, true); err == nil {
-		t.Fatal("applyConfigFile accepted bad max_size")
+		t.Fatal("applyConfigFile accepted bad maxSize")
 	}
 }
 

@@ -21,19 +21,19 @@ Go `std`:
 | `gocachez`       |          89.92s |           6.77s |      453MB |
 |                  | +8.43s (+10.3%) | +2.20s (+48.1%) |     -90.9% |
 
-## Setup
+## Installation
 
 Requires Go 1.25 or newer.
 
-```sh
-go install github.com/jakebailey/gocachez@latest
-go env -w GOCACHEPROG=gocachez
+```console
+$ go install github.com/jakebailey/gocachez@latest
+$ go env -w GOCACHEPROG=gocachez
 ```
 
 Undo:
 
-```sh
-go env -u GOCACHEPROG
+```console
+$ go env -u GOCACHEPROG
 ```
 
 ## How it works
@@ -64,39 +64,43 @@ it can acquire that lock.
 
 ## Configuration
 
-By default, `gocachez` reads:
+By default, `gocachez` reads its config from:
 
 ```text
-~/.config/gocachez/config.json
+os.UserConfigDir()/gocachez/config.json
 ```
 
 and stores cache data in:
 
 ```text
-~/.cache/gocachez
+os.UserCacheDir()/gocachez
 ```
+
+See [`os.UserConfigDir`](https://pkg.go.dev/os#UserConfigDir) and
+[`os.UserCacheDir`](https://pkg.go.dev/os#UserCacheDir) for the
+platform-specific base directories.
 
 Example config:
 
 ```json
 {
-    "cache_dir": "/path/to/gocachez",
-    "max_size": "20GiB",
+    "cacheDir": "/path/to/gocachez",
+    "maxSize": "20GiB",
     "verbose": false
 }
 ```
 
 Config can also be selected explicitly:
 
-```sh
-go env -w GOCACHEPROG="gocachez -config /path/to/config.json"
+```console
+$ go env -w GOCACHEPROG="gocachez -config /path/to/config.json"
 ```
 
 Supported options:
 
-| Config key  | Env var             | Flag        | Default                                   | Meaning                                                         |
-| ----------- | ------------------- | ----------- | ----------------------------------------- | --------------------------------------------------------------- |
-| `cache_dir` | `GOCACHEZ_DIR`      | `-dir`      | `os.UserCacheDir()/gocachez`              | Cache directory.                                                |
-| `max_size`  | `GOCACHEZ_MAX_SIZE` | `-max-size` | `20GiB`                                   | Maximum compressed cache size; `0` disables size-based pruning. |
-| `verbose`   | `GOCACHEZ_VERBOSE`  | `-v`        | `false`                                   | Enable maintenance logs on stderr.                              |
-|             | `GOCACHEZ_CONFIG`   | `-config`   | `os.UserConfigDir()/gocachez/config.json` | Config file path. Missing file is an error when explicitly set. |
+| Config key | Env var             | Flag        | Default                                   | Meaning                                                         |
+| ---------- | ------------------- | ----------- | ----------------------------------------- | --------------------------------------------------------------- |
+| `cacheDir` | `GOCACHEZ_DIR`      | `-dir`      | `os.UserCacheDir()/gocachez`              | Cache directory.                                                |
+| `maxSize`  | `GOCACHEZ_MAX_SIZE` | `-max-size` | `20GiB`                                   | Maximum compressed cache size; `0` disables size-based pruning. |
+| `verbose`  | `GOCACHEZ_VERBOSE`  | `-v`        | `false`                                   | Enable maintenance logs on stderr.                              |
+|            | `GOCACHEZ_CONFIG`   | `-config`   | `os.UserConfigDir()/gocachez/config.json` | Config file path. Missing file is an error when explicitly set. |
