@@ -300,7 +300,7 @@ func (st *store) putDecoder(dec *zstd.Decoder) {
 }
 
 func (st *store) createLiveFile(outputHex string) (string, error) {
-	file, err := os.CreateTemp(st.runDir, outputHex+"-*.body")
+	file, err := os.CreateTemp(st.runDir, outputHex+"-*")
 	if err != nil {
 		return "", fmt.Errorf("create live file: %w", err)
 	}
@@ -363,6 +363,9 @@ func (st *store) pruneLocked() error {
 	}
 	if activeRuns > 0 {
 		return nil
+	}
+	if err := st.removeOrphanRetainedFiles(); err != nil {
+		return err
 	}
 	if st.maxSize <= 0 {
 		return st.removeOrphanBlobs()
@@ -444,6 +447,43 @@ func (st *store) removeOrphanBlobs() error {
 		return err
 	}
 	return removeEmptyDirs(st.blobsDir)
+}
+
+func (st *store) removeOrphanRetainedFiles() error {
+	return st.removeOrphanOutputFiles(retainedRoot(st.versionDir), func(path string) bool {
+		return strings.HasSuffix(path, ".a") || strings.HasSuffix(path, ".go")
+	})
+}
+
+func (st *store) removeOrphanOutputFiles(root string, include func(string) bool) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat retained root: %w", err)
+	}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !include(path) {
+			return nil
+		}
+		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		entryRefs, err := st.q.countEntriesByOutputID(context.Background(), outputID)
+		if err != nil {
+			return fmt.Errorf("query retained references: %w", err)
+		}
+		if entryRefs == 0 {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove orphan retained file: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return removeEmptyDirs(root)
 }
 
 func removeEmptyDirs(root string) error {

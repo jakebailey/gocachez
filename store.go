@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +68,8 @@ type store struct {
 	accessed          map[string]int64
 }
 
+const retainedDirName = "retained"
+
 func newStore(cfg config) (*store, error) {
 	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if err := os.MkdirAll(versionDir, 0o777); err != nil {
@@ -94,6 +97,10 @@ func cachePaths(cfg config) (string, string, string, string) {
 		filepath.Join(versionDir, "blobs"),
 		filepath.Join(versionDir, "live"),
 		filepath.Join(versionDir, "lifecycle.lock")
+}
+
+func retainedRoot(versionDir string) string {
+	return filepath.Join(versionDir, retainedDirName)
 }
 
 func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPath string) (*store, error) {
@@ -248,19 +255,95 @@ func (st *store) registerRun() error {
 }
 
 func (st *store) unregisterRun() error {
-	if err := st.q.deleteRun(context.Background(), st.runID); err != nil {
-		return fmt.Errorf("delete run record: %w", err)
+	var err error
+	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
+		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
 	}
-	if err := st.runLock.Unlock(); err != nil {
-		return fmt.Errorf("unlock live run: %w", err)
+	retainedLiveFiles, prepareErr := st.prepareLiveRunForClose()
+	if prepareErr != nil {
+		err = errors.Join(err, prepareErr)
 	}
-	if err := st.runLock.Close(); err != nil {
-		return fmt.Errorf("close live run lock: %w", err)
+	if unlockErr := st.runLock.Unlock(); unlockErr != nil {
+		err = errors.Join(err, fmt.Errorf("unlock live run: %w", unlockErr))
 	}
-	if err := os.RemoveAll(st.runDir); err != nil {
-		return fmt.Errorf("remove live run dir: %w", err)
+	if closeErr := st.runLock.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close live run lock: %w", closeErr))
 	}
-	return nil
+	if !retainedLiveFiles {
+		if removeErr := os.RemoveAll(st.runDir); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove live run dir: %w", removeErr))
+		}
+	}
+	return err
+}
+
+func (st *store) prepareLiveRunForClose() (bool, error) {
+	entries, err := os.ReadDir(st.runDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read live run dir: %w", err)
+	}
+
+	retained := false
+	for _, entry := range entries {
+		if entry.Name() == "run.lock" {
+			continue
+		}
+		path := filepath.Join(st.runDir, entry.Name())
+		if !entry.Type().IsRegular() {
+			if err := os.RemoveAll(path); err != nil {
+				return false, fmt.Errorf("remove live path: %w", err)
+			}
+			continue
+		}
+		stripped, err := st.stripLivePackageArchiveToExport(path)
+		if err != nil {
+			return false, err
+		}
+		if stripped {
+			retained = true
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("remove live file: %w", err)
+		}
+	}
+	return retained, nil
+}
+
+func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
+	outputID := liveOutputID(path)
+	if outputID == "" {
+		return stripPackageArchiveToExport(path, "")
+	}
+	retained, err := stripPackageArchiveToExport(path, st.retainedPath(outputID, ".a"))
+	if err != nil || retained {
+		return retained, err
+	}
+	return retainGeneratedCgoSource(path, st.retainedPath(outputID, ".go"))
+}
+
+func liveOutputID(path string) string {
+	base := filepath.Base(path)
+	outputID, _, ok := strings.Cut(base, "-")
+	if !ok {
+		return ""
+	}
+	return outputID
+}
+
+func (st *store) retainedDir(outputHex string) string {
+	shard := "xx"
+	if len(outputHex) >= 2 {
+		shard = outputHex[:2]
+	}
+	return filepath.Join(retainedRoot(st.versionDir), shard)
+}
+
+func (st *store) retainedPath(outputHex, ext string) string {
+	return filepath.Join(st.retainedDir(outputHex), outputHex+ext)
 }
 
 func (st *store) cleanupAbandonedRuns() error {

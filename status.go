@@ -21,6 +21,8 @@ type cacheStatus struct {
 	catalog          catalogStatus
 	blobFiles        int64
 	blobSize         int64
+	retainedFiles    int64
+	retainedSize     int64
 	activeLiveRuns   int64
 	inactiveLiveRuns int64
 }
@@ -81,6 +83,9 @@ func writeStatus(cfg config, w io.Writer) error {
 	if _, err := fmt.Fprintf(w, "Blobs: %d files, %s (%d bytes)\n", status.blobFiles, formatSize(status.blobSize), status.blobSize); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
+	if _, err := fmt.Fprintf(w, "Retained files: %d files, %s (%d bytes)\n", status.retainedFiles, formatSize(status.retainedSize), status.retainedSize); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
 	if _, err := fmt.Fprintf(w, "Live runs: %d active, %d inactive\n", status.activeLiveRuns, status.inactiveLiveRuns); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
@@ -115,6 +120,10 @@ func readStatus(cfg config) (cacheStatus, error) {
 			return err
 		}
 		status.blobFiles, status.blobSize, err = readBlobStatus(blobsDir)
+		if err != nil {
+			return err
+		}
+		status.retainedFiles, status.retainedSize, err = readRetainedStatus(retainedRoot(versionDir))
 		if err != nil {
 			return err
 		}
@@ -163,17 +172,25 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, error) {
 }
 
 func readBlobStatus(blobsDir string) (int64, int64, error) {
+	return readSuffixedFileStatus(blobsDir, ".zst")
+}
+
+func readRetainedStatus(root string) (int64, int64, error) {
+	return readSuffixedFileStatus(root, "")
+}
+
+func readSuffixedFileStatus(root, suffix string) (int64, int64, error) {
 	var files, size int64
-	err := filepath.WalkDir(blobsDir, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(path, ".zst") {
+		if d.IsDir() || !strings.HasSuffix(path, suffix) {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
-			return fmt.Errorf("stat blob: %w", err)
+			return fmt.Errorf("stat file: %w", err)
 		}
 		files++
 		size += info.Size()

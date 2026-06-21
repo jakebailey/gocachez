@@ -96,6 +96,19 @@ exits abnormally, a later run can safely clean up abandoned live files: each run
 holds an OS file lock, and another process only reclaims a run directory after
 it can acquire that lock.
 
+Some live files can escape the Go command process through `go list` output. For
+example, `go list -export` reports an `Export` path that tools such as
+`go/packages` and `golangci-lint` may open after the Go command has closed its
+`GOCACHEPROG` helper. `go list -compiled` can also report generated cgo source
+paths in `CompiledGoFiles`.
+
+To support those tools without keeping large uncompressed archives around,
+`gocachez` treats these escaped files specially on close. Package archives are
+replaced with small archives containing only their `__.PKGDEF` export data, and
+generated cgo source files are retained as-is. These retained files are stored
+under `retained/`, keyed by output ID, and are cleaned up once no catalog entry
+references that output.
+
 ## Configuration
 
 By default, `gocachez` reads its config from:
