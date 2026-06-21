@@ -98,9 +98,30 @@ $ go env -w GOCACHEPROG="gocachez -config /path/to/config.json"
 
 Supported options:
 
-| Config key | Env var             | Flag        | Default                                   | Meaning                                                         |
-| ---------- | ------------------- | ----------- | ----------------------------------------- | --------------------------------------------------------------- |
-| `cacheDir` | `GOCACHEZ_DIR`      | `-dir`      | `os.UserCacheDir()/gocachez`              | Cache directory.                                                |
-| `maxSize`  | `GOCACHEZ_MAX_SIZE` | `-max-size` | `20GiB`                                   | Maximum compressed cache size; `0` disables size-based pruning. |
-| `verbose`  | `GOCACHEZ_VERBOSE`  | `-v`        | `false`                                   | Enable maintenance logs on stderr.                              |
-|            | `GOCACHEZ_CONFIG`   | `-config`   | `os.UserConfigDir()/gocachez/config.json` | Config file path. Missing file is an error when explicitly set. |
+**Cache directory**
+
+- Config: `cacheDir`
+- Environment: `GOCACHEZ_DIR`
+- Flag: `-dir`
+- Default: `os.UserCacheDir()/gocachez`
+
+**Maximum compressed cache size**
+
+- Config: `maxSize`
+- Environment: `GOCACHEZ_MAX_SIZE`
+- Flag: `-max-size`
+- Default: `20GiB`; `0` disables size-based pruning.
+
+**Verbose maintenance logs**
+
+- Config: `verbose`
+- Environment: `GOCACHEZ_VERBOSE`
+- Flag: `-v`
+- Default: `false`
+
+**Config file path**
+
+- Environment: `GOCACHEZ_CONFIG`
+- Flag: `-config`
+- Default: `os.UserConfigDir()/gocachez/config.json`
+- Missing file is an error when explicitly set.

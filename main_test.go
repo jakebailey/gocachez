@@ -1280,14 +1280,13 @@ func TestCorruptBlobIsCacheMiss(t *testing.T) {
 }
 
 func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
-	cacheBase := t.TempDir()
-	configBase := t.TempDir()
-	cacheDir := filepath.Join(cacheBase, "configured-cache")
-	configDir := filepath.Join(configBase, "gocachez")
-	if err := os.MkdirAll(configDir, 0o777); err != nil {
+	setUserDirEnv(t)
+
+	configPath, _ := defaultConfigPath()
+	cacheDir := filepath.Join(t.TempDir(), "configured-cache")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o777); err != nil {
 		t.Fatal(err)
 	}
-	configPath := filepath.Join(configDir, "config.json")
 	configJSON := `{
 		"cacheDir": ` + strconvQuote(cacheDir) + `,
 		"maxSize": "123MiB",
@@ -1296,9 +1295,6 @@ func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_CACHE_HOME", cacheBase)
-	t.Setenv("XDG_CONFIG_HOME", configBase)
-	t.Setenv("GOCACHEZ_CONFIG", "")
 
 	cfg, err := parseFlags(nil)
 	if err != nil {
@@ -1316,17 +1312,17 @@ func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
 }
 
 func TestParseFlagsUsesUserCacheDirDefault(t *testing.T) {
-	cacheBase := t.TempDir()
-	configBase := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", cacheBase)
-	t.Setenv("XDG_CONFIG_HOME", configBase)
-	t.Setenv("GOCACHEZ_CONFIG", "")
+	setUserDirEnv(t)
 
 	cfg, err := parseFlags(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(cacheBase, "gocachez")
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(userCacheDir, "gocachez")
 	if cfg.dir != want {
 		t.Fatalf("dir = %q, want %q", cfg.dir, want)
 	}
@@ -1543,6 +1539,28 @@ func assertNonEmptyFile(t *testing.T, path string) {
 	if info.Size() == 0 {
 		t.Fatalf("%s is empty", path)
 	}
+}
+
+func setUserDirEnv(t *testing.T) {
+	t.Helper()
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	cacheDir := filepath.Join(root, "cache")
+	configDir := filepath.Join(root, "config")
+	for _, dir := range []string{home, cacheDir, configDir} {
+		if err := os.MkdirAll(dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("LOCALAPPDATA", cacheDir)
+	t.Setenv("APPDATA", configDir)
+	t.Setenv("GOCACHEZ_CONFIG", "")
 }
 
 func abandonStore(t *testing.T, st *store) {
