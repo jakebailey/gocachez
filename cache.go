@@ -77,8 +77,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		return response{}, fmt.Errorf("create zstd encoder: %w", err)
 	}
 
-	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw, hash), body)
+	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw), body)
 	closeErr := zw.Close()
 	st.putEncoder(zw)
 	bodyCloseErr := bodyFile.Close()
