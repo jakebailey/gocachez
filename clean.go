@@ -53,6 +53,10 @@ func (st *store) cleanLocked() error {
 	}
 	activeRuns := int64(0)
 	if st.q != nil {
+		if err := st.removeOrphanRetainedFiles(); err != nil {
+			_ = st.db.Close()
+			return err
+		}
 		activeRuns, err = st.q.countRuns(context.Background())
 		if err != nil {
 			_ = st.db.Close()
@@ -79,6 +83,9 @@ func (st *store) cleanLocked() error {
 	}
 	if err := os.RemoveAll(st.liveRoot); err != nil {
 		return fmt.Errorf("remove live dir: %w", err)
+	}
+	if err := os.RemoveAll(retainedRoot(st.versionDir)); err != nil {
+		return fmt.Errorf("remove retained dir: %w", err)
 	}
 	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
