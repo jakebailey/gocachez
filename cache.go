@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -247,8 +246,7 @@ func (st *store) materialize(ent entry) (string, error) {
 		return "", fmt.Errorf("create live file: %w", err)
 	}
 
-	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(bodyFile, hash), zr)
+	written, copyErr := io.Copy(bodyFile, zr)
 	closeErr := bodyFile.Close()
 	if copyErr != nil {
 		return "", fmt.Errorf("%w: decompress cache entry: %w", errInvalidCacheEntry, copyErr)
@@ -258,9 +256,6 @@ func (st *store) materialize(ent entry) (string, error) {
 	}
 	if written != ent.Size {
 		return "", fmt.Errorf("%w: decompressed size mismatch: got %d bytes, expected %d", errInvalidCacheEntry, written, ent.Size)
-	}
-	if got := hex.EncodeToString(hash.Sum(nil)); got != ent.OutputID {
-		return "", fmt.Errorf("%w: decompressed checksum mismatch: got %s, expected %s", errInvalidCacheEntry, got, ent.OutputID)
 	}
 
 	keepBody = true

@@ -182,63 +182,88 @@ func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 func TestInvalidMaterializedBlobIsCacheMiss(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name     string
-		body     []byte
-		outputID []byte
-		size     int64
-	}{
-		{
-			name:     "size mismatch",
-			body:     []byte("body"),
-			outputID: sha256Sum([]byte("body")),
-			size:     5,
-		},
-		{
-			name:     "checksum mismatch",
-			body:     []byte("body"),
-			outputID: bytes.Repeat([]byte{37}, 32),
-			size:     4,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	st, err := newStore(config{
+		dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
 
-			st, err := newStore(config{
-				dir: t.TempDir(),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer st.close()
+	actionID := bytes.Repeat([]byte{38}, 32)
+	body := []byte("body")
+	outputHex := hexOf(sha256Sum(body))
+	if err := os.MkdirAll(st.blobDir(outputHex), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCompressedFile(st, st.blobPath(outputHex), body); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEntry(entry{
+		ActionID:       hexOf(actionID),
+		OutputID:       outputHex,
+		Size:           int64(len(body)) + 1,
+		CompressedSize: int64(len(body)),
+		CreatedAt:      time.Now(),
+		AccessedAt:     time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-			actionID := bytes.Repeat([]byte{38}, 32)
-			outputHex := hexOf(tc.outputID)
-			if err := os.MkdirAll(st.blobDir(outputHex), 0o777); err != nil {
-				t.Fatal(err)
-			}
-			if err := writeCompressedFile(st, st.blobPath(outputHex), tc.body); err != nil {
-				t.Fatal(err)
-			}
-			if err := st.upsertEntry(entry{
-				ActionID:       hexOf(actionID),
-				OutputID:       outputHex,
-				Size:           tc.size,
-				CompressedSize: int64(len(tc.body)),
-				CreatedAt:      time.Now(),
-				AccessedAt:     time.Now(),
-			}); err != nil {
-				t.Fatal(err)
-			}
+	res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Miss {
+		t.Fatalf("get response = %+v, want miss", res)
+	}
+}
 
-			res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !res.Miss {
-				t.Fatalf("get response = %+v, want miss", res)
-			}
-		})
+func TestOutputIDIsOpaque(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{39}, 32)
+	outputID := bytes.Repeat([]byte{40}, 32)
+	body := []byte("body")
+	outputHex := hexOf(outputID)
+	if err := os.MkdirAll(st.blobDir(outputHex), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCompressedFile(st, st.blobPath(outputHex), body); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEntry(entry{
+		ActionID:       hexOf(actionID),
+		OutputID:       outputHex,
+		Size:           int64(len(body)),
+		CompressedSize: int64(len(body)),
+		CreatedAt:      time.Now(),
+		AccessedAt:     time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Miss || !bytes.Equal(res.OutputID, outputID) {
+		t.Fatalf("get response = %+v, want hit with opaque OutputID %x", res, outputID)
+	}
+	got, err := os.ReadFile(res.DiskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
 	}
 }
 
