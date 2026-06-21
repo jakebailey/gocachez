@@ -24,6 +24,14 @@ const (
 	cmdClose command = "close"
 )
 
+type runMode string
+
+const (
+	runModeProtocol runMode = ""
+	runModeClean    runMode = "clean"
+	runModeStatus   runMode = "status"
+)
+
 type request struct {
 	ID       int64
 	Command  command
@@ -44,7 +52,11 @@ type response struct {
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
-	cfg, err := parseFlags(args)
+	if mode, ok := helpMode(args); ok {
+		return writeHelp(stdout, mode)
+	}
+
+	cfg, mode, err := parseRunArgs(args)
 	if err != nil {
 		return err
 	}
@@ -57,6 +69,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 			err = profileErr
 		}
 	}()
+
+	if mode == runModeClean {
+		return cleanCache(cfg)
+	}
+	if mode == runModeStatus {
+		return writeStatus(cfg, stdout)
+	}
 
 	st, err := newStore(cfg)
 	if err != nil {
@@ -103,6 +122,20 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 			}
 		}
 	}
+}
+
+func parseRunArgs(args []string) (config, runMode, error) {
+	if len(args) != 0 && isRunMode(args[0]) {
+		cfg, err := parseFlags(args[1:])
+		return cfg, runMode(args[0]), err
+	}
+
+	cfg, err := parseFlags(args)
+	return cfg, runModeProtocol, err
+}
+
+func isRunMode(arg string) bool {
+	return arg == string(runModeClean) || arg == string(runModeStatus)
 }
 
 func startProfiling(cfg config) (func() error, error) {

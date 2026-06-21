@@ -39,6 +39,37 @@ Undo:
 $ go env -u GOCACHEPROG
 ```
 
+## Commands
+
+Show help:
+
+```console
+$ gocachez -h
+```
+
+Run as a `GOCACHEPROG` helper:
+
+```console
+$ gocachez
+```
+
+Remove inactive cache state:
+
+```console
+$ gocachez clean
+```
+
+`clean` removes blobs, live files, and catalog state that no active `gocachez`
+process is using. State for active live runs is preserved.
+
+Show cache state:
+
+```console
+$ gocachez status
+```
+
+`status` reports the current cache configuration and state.
+
 ## How it works
 
 `gocachez` implements the Go command's external cache protocol over stdin and

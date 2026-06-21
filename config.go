@@ -26,9 +26,20 @@ type fileConfig struct {
 }
 
 func parseFlags(args []string) (config, error) {
-	cfg, err := defaultConfig()
+	cfg, operands, err := parseFlagOperands(args)
 	if err != nil {
 		return config{}, err
+	}
+	if len(operands) != 0 {
+		return config{}, fmt.Errorf("unexpected argument %q", operands[0])
+	}
+	return cfg, nil
+}
+
+func parseFlagOperands(args []string) (config, []string, error) {
+	cfg, err := defaultConfig()
+	if err != nil {
+		return config{}, nil, err
 	}
 	configPath, configRequired := defaultConfigPath()
 
@@ -44,7 +55,7 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	fs.StringVar(&cfg.memProfile, "memprofile", "", "write memory profile to file")
 	if err := fs.Parse(args); err != nil {
-		return config{}, err
+		return config{}, nil, err
 	}
 
 	visited := map[string]bool{}
@@ -57,7 +68,7 @@ func parseFlags(args []string) (config, error) {
 
 	if configPath != "" {
 		if err := applyConfigFile(&cfg, configPath, configRequired); err != nil {
-			return config{}, err
+			return config{}, nil, err
 		}
 	}
 	if value := os.Getenv("GOCACHEZ_DIR"); value != "" {
@@ -65,12 +76,12 @@ func parseFlags(args []string) (config, error) {
 	}
 	if value := os.Getenv("GOCACHEZ_MAX_SIZE"); value != "" {
 		if cfg.maxSize, err = parseSize(value); err != nil {
-			return config{}, fmt.Errorf("parse GOCACHEZ_MAX_SIZE: %w", err)
+			return config{}, nil, fmt.Errorf("parse GOCACHEZ_MAX_SIZE: %w", err)
 		}
 	}
 	if value := os.Getenv("GOCACHEZ_VERBOSE"); value != "" {
 		if cfg.verbose, err = strconv.ParseBool(value); err != nil {
-			return config{}, fmt.Errorf("parse GOCACHEZ_VERBOSE: %w", err)
+			return config{}, nil, fmt.Errorf("parse GOCACHEZ_VERBOSE: %w", err)
 		}
 	}
 
@@ -79,7 +90,7 @@ func parseFlags(args []string) (config, error) {
 	}
 	if visited["max-size"] {
 		if cfg.maxSize, err = parseSize(flagMaxSize); err != nil {
-			return config{}, fmt.Errorf("parse -max-size: %w", err)
+			return config{}, nil, fmt.Errorf("parse -max-size: %w", err)
 		}
 	}
 	if visited["v"] {
@@ -88,10 +99,10 @@ func parseFlags(args []string) (config, error) {
 
 	abs, err := filepath.Abs(cfg.dir)
 	if err != nil {
-		return config{}, fmt.Errorf("resolve cache dir: %w", err)
+		return config{}, nil, fmt.Errorf("resolve cache dir: %w", err)
 	}
 	cfg.dir = abs
-	return cfg, nil
+	return cfg, fs.Args(), nil
 }
 
 func defaultConfig() (config, error) {

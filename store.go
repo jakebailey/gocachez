@@ -68,9 +68,35 @@ type store struct {
 }
 
 func newStore(cfg config) (*store, error) {
+	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	if err := os.MkdirAll(versionDir, 0o777); err != nil {
+		return nil, fmt.Errorf("create version dir: %w", err)
+	}
+
+	var st *store
+	err := withFileLock(lifecycleLockPath, func() error {
+		var err error
+		st, err = newStoreLocked(cfg, versionDir, blobsDir, liveRoot, lifecycleLockPath)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
+		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
+	}
+	return st, nil
+}
+
+func cachePaths(cfg config) (string, string, string, string) {
 	versionDir := filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheSchemaVersion))
-	blobsDir := filepath.Join(versionDir, "blobs")
-	liveRoot := filepath.Join(versionDir, "live")
+	return versionDir,
+		filepath.Join(versionDir, "blobs"),
+		filepath.Join(versionDir, "live"),
+		filepath.Join(versionDir, "lifecycle.lock")
+}
+
+func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPath string) (*store, error) {
 	if err := os.MkdirAll(blobsDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create blobs dir: %w", err)
 	}
@@ -103,28 +129,29 @@ func newStore(cfg config) (*store, error) {
 		versionDir:        versionDir,
 		blobsDir:          blobsDir,
 		liveRoot:          liveRoot,
-		lifecycleLockPath: filepath.Join(versionDir, "lifecycle.lock"),
+		lifecycleLockPath: lifecycleLockPath,
 		runID:             runID,
 		runDir:            runDir,
 		runLock:           runLock,
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
 	}
-	if err := st.withLifecycleLock(st.registerRun); err != nil {
+	if err := st.registerRun(); err != nil {
 		_ = db.Close()
 		_ = runLock.Unlock()
 		_ = runLock.Close()
 		_ = os.RemoveAll(runDir)
 		return nil, err
 	}
-	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
-		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
-	}
 	return st, nil
 }
 
 func (st *store) withLifecycleLock(fn func() error) error {
-	lock := flock.New(st.lifecycleLockPath)
+	return withFileLock(st.lifecycleLockPath, fn)
+}
+
+func withFileLock(path string, fn func() error) error {
+	lock := flock.New(path)
 	if err := lock.Lock(); err != nil {
 		_ = lock.Close()
 		return fmt.Errorf("lock cache lifecycle: %w", err)
@@ -153,6 +180,28 @@ func openDB(path string) (*sql.DB, error) {
 	if err := initDB(db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	return db, nil
+}
+
+func openExistingDB(path string) (*sql.DB, error) {
+	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open catalog: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	ctx := context.Background()
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("read catalog version: %w", err)
+	}
+	if version != cacheSchemaVersion {
+		_ = db.Close()
+		return nil, fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
 	}
 	return db, nil
 }

@@ -1121,6 +1121,12 @@ func TestRunRejectsBadArgsAndCacheDir(t *testing.T) {
 	if err := run([]string{"-bad"}, strings.NewReader(""), &stdout); err == nil {
 		t.Fatal("run accepted bad args")
 	}
+	if err := run([]string{"wat"}, strings.NewReader(""), &stdout); err == nil {
+		t.Fatal("run accepted unexpected argument")
+	}
+	if err := run([]string{"-dir", t.TempDir(), "status"}, strings.NewReader(""), &stdout); err == nil {
+		t.Fatal("run accepted flags before subcommand")
+	}
 
 	cacheFile := filepath.Join(t.TempDir(), "cache-file")
 	if err := os.WriteFile(cacheFile, nil, 0o666); err != nil {
@@ -1130,6 +1136,273 @@ func TestRunRejectsBadArgsAndCacheDir(t *testing.T) {
 	if err := run([]string{"-dir", cacheFile}, strings.NewReader(""), &stdout); err == nil {
 		t.Fatal("run accepted file cache dir")
 	}
+}
+
+func TestRunHelp(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "root", args: []string{"-h"}, want: "Usage:\n  gocachez [flags]\n"},
+		{name: "clean", args: []string{"clean", "-h"}, want: "Usage:\n  gocachez clean [flags]\n"},
+		{name: "status", args: []string{"status", "-dir", t.TempDir(), "-h"}, want: "Usage:\n  gocachez status [flags]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var stdout bytes.Buffer
+			if err := run(tc.args, strings.NewReader(""), &stdout); err != nil {
+				t.Fatal(err)
+			}
+			assertContains(t, stdout.String(), tc.want)
+			assertContains(t, stdout.String(), "-h")
+		})
+	}
+}
+
+func TestRunHelpDoesNotCreateCacheState(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	if err := run([]string{"clean", "-h", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "v1")); !os.IsNotExist(err) {
+		t.Fatalf("help created cache state: %v", err)
+	}
+}
+
+func TestRunCleanRemovesInactiveState(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID := bytes.Repeat([]byte{43}, 32)
+	outputID := bytes.Repeat([]byte{44}, 32)
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	dbPath := filepath.Join(st.versionDir, "cache.db")
+	st.close()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"clean", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("clean stdout = %q, want empty", stdout.String())
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("blob stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("live file stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("catalog stat err = %v, want not exist", err)
+	}
+}
+
+func TestRunCleanKeepsActiveState(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{45}, 32)
+	outputID := bytes.Repeat([]byte{46}, 32)
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+
+	if err := run([]string{"clean", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("active blob was removed: %v", err)
+	}
+	if _, err := os.Stat(res.DiskPath); err != nil {
+		t.Fatalf("active live file was removed: %v", err)
+	}
+	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
+		t.Fatalf("active entry was removed: %v", err)
+	}
+}
+
+func TestRunCleanRemovesAbandonedState(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID := bytes.Repeat([]byte{47}, 32)
+	outputID := bytes.Repeat([]byte{48}, 32)
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobPath := st.blobPath(hexOf(outputID))
+	runDir := st.runDir
+	abandonStore(t, st)
+
+	if err := run([]string{"clean", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("abandoned run dir stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("abandoned live file stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("abandoned blob stat err = %v, want not exist", err)
+	}
+}
+
+func TestRunStatusEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	got := stdout.String()
+	assertContains(t, got, "Cache directory: "+cacheDir)
+	assertContains(t, got, "Max size: 20.0GiB (21474836480 bytes)")
+	assertContains(t, got, "Verbose: false")
+	assertContains(t, got, "Catalog: missing")
+	assertContains(t, got, "Entries: 0")
+	assertContains(t, got, "Outputs: 0")
+	assertContains(t, got, "Blobs: 0 files, 0B (0 bytes)")
+	assertContains(t, got, "Live runs: 0 active, 0 inactive")
+}
+
+func TestRunStatusShowsEffectiveConfig(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir, "-max-size", "1MiB", "-v"}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	got := stdout.String()
+	assertContains(t, got, "Cache directory: "+cacheDir)
+	assertContains(t, got, "Max size: 1.0MiB (1048576 bytes)")
+	assertContains(t, got, "Verbose: true")
+}
+
+func TestRunStatusInactiveCache(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID := bytes.Repeat([]byte{49}, 32)
+	outputID := bytes.Repeat([]byte{50}, 32)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	got := stdout.String()
+	assertContains(t, got, "Catalog: present")
+	assertContains(t, got, "Entries: 1")
+	assertContains(t, got, "Outputs: 1")
+	assertContains(t, got, "Catalog runs: 0")
+	assertContains(t, got, "Blobs: 1 files, ")
+	assertContains(t, got, "Live runs: 0 active, 0 inactive")
+}
+
+func TestRunStatusActiveCache(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{51}, 32)
+	outputID := bytes.Repeat([]byte{52}, 32)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: 4,
+	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
+		t.Fatal(err)
+	}
+	got := stdout.String()
+	assertContains(t, got, "Catalog: present")
+	assertContains(t, got, "Entries: 1")
+	assertContains(t, got, "Outputs: 1")
+	assertContains(t, got, "Catalog runs: 1")
+	assertContains(t, got, "Blobs: 1 files, ")
+	assertContains(t, got, "Live runs: 1 active, 0 inactive")
 }
 
 func TestRunReportsInitialWriteError(t *testing.T) {
@@ -1685,6 +1958,13 @@ func assertNonEmptyFile(t *testing.T, path string) {
 	}
 	if info.Size() == 0 {
 		t.Fatalf("%s is empty", path)
+	}
+}
+
+func assertContains(t *testing.T, got, want string) {
+	t.Helper()
+	if !strings.Contains(got, want) {
+		t.Fatalf("output missing %q:\n%s", want, got)
 	}
 }
 
