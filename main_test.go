@@ -1314,6 +1314,9 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "Catalog: missing")
 	assertContains(t, got, "Entries: 0")
 	assertContains(t, got, "Outputs: 0")
+	assertContains(t, got, "Catalog uncompressed size: 0B (0 bytes)")
+	assertContains(t, got, "Catalog compressed size: 0B (0 bytes)")
+	assertContains(t, got, "Catalog savings: 0B (0.0%)")
 	assertContains(t, got, "Blobs: 0 files, 0B (0 bytes)")
 	assertContains(t, got, "Live runs: 0 active, 0 inactive")
 }
@@ -1363,6 +1366,9 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "Catalog: present")
 	assertContains(t, got, "Entries: 1")
 	assertContains(t, got, "Outputs: 1")
+	assertContains(t, got, "Catalog uncompressed size: 4B (4 bytes)")
+	assertContains(t, got, "Catalog compressed size: ")
+	assertContains(t, got, "Catalog savings: ")
 	assertContains(t, got, "Catalog runs: 0")
 	assertContains(t, got, "Blobs: 1 files, ")
 	assertContains(t, got, "Live runs: 0 active, 0 inactive")
@@ -1894,6 +1900,41 @@ func TestFormatSize(t *testing.T) {
 		if got := formatSize(input); got != want {
 			t.Fatalf("formatSize(%d) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestFormatSavings(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		uncompressed int64
+		compressed   int64
+		want         string
+	}{
+		"empty": {
+			uncompressed: 0,
+			compressed:   0,
+			want:         "0B (0.0%)",
+		},
+		"saved": {
+			uncompressed: 100,
+			compressed:   25,
+			want:         "75B (75.0%)",
+		},
+		"grew": {
+			uncompressed: 100,
+			compressed:   125,
+			want:         "-25B (-25.0%)",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := formatSavings(tc.uncompressed, tc.compressed); got != tc.want {
+				t.Fatalf("formatSavings(%d, %d) = %q, want %q", tc.uncompressed, tc.compressed, got, tc.want)
+			}
+		})
 	}
 }
 

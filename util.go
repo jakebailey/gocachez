@@ -91,6 +91,15 @@ func formatSize(size int64) string {
 	return fmt.Sprintf("%.1f%ciB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
+func formatSavings(uncompressed, compressed int64) string {
+	if uncompressed <= 0 {
+		return "0B (0.0%)"
+	}
+	saved := uncompressed - compressed
+	percent := float64(saved) / float64(uncompressed) * 100
+	return fmt.Sprintf("%s (%.1f%%)", formatSize(saved), percent)
+}
+
 func unixMillis(t time.Time) int64 {
 	return t.UnixNano() / int64(time.Millisecond)
 }

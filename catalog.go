@@ -144,6 +144,18 @@ FROM (
 	return size, err
 }
 
+func catalogSize(ctx context.Context, db catalogDB) (int64, error) {
+	var size int64
+	err := db.QueryRowContext(ctx, `
+SELECT CAST(COALESCE(SUM(size), 0) AS INTEGER)
+FROM (
+	SELECT output_id, MAX(size) AS size
+	FROM entries
+	GROUP BY output_id
+)`).Scan(&size)
+	return size, err
+}
+
 func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {
 	rows, err := c.db.QueryContext(ctx, `
 SELECT e.output_id, CAST(MAX(e.compressed_size) AS INTEGER)

@@ -13,19 +13,24 @@ import (
 )
 
 type cacheStatus struct {
-	cacheDir              string
-	maxSize               int64
-	verbose               bool
-	versionDir            string
-	catalogExists         bool
-	entries               int64
-	outputs               int64
-	catalogCompressedSize int64
-	catalogRuns           int64
-	blobFiles             int64
-	blobSize              int64
-	activeLiveRuns        int64
-	inactiveLiveRuns      int64
+	cacheDir         string
+	maxSize          int64
+	verbose          bool
+	versionDir       string
+	catalogExists    bool
+	catalog          catalogStatus
+	blobFiles        int64
+	blobSize         int64
+	activeLiveRuns   int64
+	inactiveLiveRuns int64
+}
+
+type catalogStatus struct {
+	entries        int64
+	outputs        int64
+	size           int64
+	compressedSize int64
+	runs           int64
 }
 
 func writeStatus(cfg config, w io.Writer) error {
@@ -55,16 +60,22 @@ func writeStatus(cfg config, w io.Writer) error {
 			return fmt.Errorf("write status: %w", err)
 		}
 	}
-	if _, err := fmt.Fprintf(w, "Entries: %d\n", status.entries); err != nil {
+	if _, err := fmt.Fprintf(w, "Entries: %d\n", status.catalog.entries); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
-	if _, err := fmt.Fprintf(w, "Outputs: %d\n", status.outputs); err != nil {
+	if _, err := fmt.Fprintf(w, "Outputs: %d\n", status.catalog.outputs); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
-	if _, err := fmt.Fprintf(w, "Catalog compressed size: %s (%d bytes)\n", formatSize(status.catalogCompressedSize), status.catalogCompressedSize); err != nil {
+	if _, err := fmt.Fprintf(w, "Catalog uncompressed size: %s (%d bytes)\n", formatSize(status.catalog.size), status.catalog.size); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
-	if _, err := fmt.Fprintf(w, "Catalog runs: %d\n", status.catalogRuns); err != nil {
+	if _, err := fmt.Fprintf(w, "Catalog compressed size: %s (%d bytes)\n", formatSize(status.catalog.compressedSize), status.catalog.compressedSize); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "Catalog savings: %s\n", formatSavings(status.catalog.size, status.catalog.compressedSize)); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "Catalog runs: %d\n", status.catalog.runs); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
 	if _, err := fmt.Fprintf(w, "Blobs: %d files, %s (%d bytes)\n", status.blobFiles, formatSize(status.blobSize), status.blobSize); err != nil {
@@ -99,7 +110,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 	}
 	err := st.withLifecycleLock(func() error {
 		var err error
-		status.catalogExists, status.entries, status.outputs, status.catalogCompressedSize, status.catalogRuns, err = readCatalogStatus(filepath.Join(versionDir, "cache.db"))
+		status.catalogExists, status.catalog, err = readCatalogStatus(filepath.Join(versionDir, "cache.db"))
 		if err != nil {
 			return err
 		}
@@ -116,35 +127,39 @@ func readStatus(cfg config) (cacheStatus, error) {
 	return status, nil
 }
 
-func readCatalogStatus(dbPath string) (bool, int64, int64, int64, int64, error) {
+func readCatalogStatus(dbPath string) (bool, catalogStatus, error) {
 	if !regularFile(dbPath) {
-		return false, 0, 0, 0, 0, nil
+		return false, catalogStatus{}, nil
 	}
 
 	db, err := openExistingDB(dbPath)
 	if err != nil {
-		return false, 0, 0, 0, 0, err
+		return false, catalogStatus{}, err
 	}
 	defer db.Close() //nolint:errcheck
 
 	ctx := context.Background()
-	var entries, outputs int64
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&entries); err != nil {
-		return false, 0, 0, 0, 0, fmt.Errorf("count catalog entries: %w", err)
+	var status catalogStatus
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&status.entries); err != nil {
+		return false, catalogStatus{}, fmt.Errorf("count catalog entries: %w", err)
 	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT output_id) FROM entries`).Scan(&outputs); err != nil {
-		return false, 0, 0, 0, 0, fmt.Errorf("count catalog outputs: %w", err)
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT output_id) FROM entries`).Scan(&status.outputs); err != nil {
+		return false, catalogStatus{}, fmt.Errorf("count catalog outputs: %w", err)
+	}
+	status.size, err = catalogSize(ctx, db)
+	if err != nil {
+		return false, catalogStatus{}, err
 	}
 	q := newCatalog(db)
-	compressedSize, err := q.compressedSize(ctx)
+	status.compressedSize, err = q.compressedSize(ctx)
 	if err != nil {
-		return false, 0, 0, 0, 0, fmt.Errorf("calculate catalog compressed size: %w", err)
+		return false, catalogStatus{}, fmt.Errorf("calculate catalog compressed size: %w", err)
 	}
-	runs, err := q.countRuns(ctx)
+	status.runs, err = q.countRuns(ctx)
 	if err != nil {
-		return false, 0, 0, 0, 0, fmt.Errorf("count catalog runs: %w", err)
+		return false, catalogStatus{}, fmt.Errorf("count catalog runs: %w", err)
 	}
-	return true, entries, outputs, compressedSize, runs, nil
+	return true, status, nil
 }
 
 func readBlobStatus(blobsDir string) (int64, int64, error) {
