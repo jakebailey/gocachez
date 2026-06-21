@@ -510,13 +510,21 @@ func removeEmptyDirs(root string) error {
 }
 
 func (st *store) blobDir(outputHex string) string {
+	return blobDir(st.blobsDir, outputHex)
+}
+
+func blobDir(blobsDir, outputHex string) string {
 	shard := "xx"
 	if len(outputHex) >= 2 {
 		shard = outputHex[:2]
 	}
-	return filepath.Join(st.blobsDir, shard)
+	return filepath.Join(blobsDir, shard)
 }
 
 func (st *store) blobPath(outputHex string) string {
-	return filepath.Join(st.blobDir(outputHex), outputHex+".zst")
+	return blobPath(st.blobsDir, outputHex)
+}
+
+func blobPath(blobsDir, outputHex string) string {
+	return filepath.Join(blobDir(blobsDir, outputHex), outputHex+".zst")
 }

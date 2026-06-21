@@ -21,6 +21,12 @@ type catalogRun struct {
 	lockPath string
 }
 
+type catalogOutput struct {
+	outputID       string
+	size           int64
+	compressedSize int64
+}
+
 func newCatalog(db catalogDB) *catalog {
 	return &catalog{db: db}
 }
@@ -154,6 +160,30 @@ FROM (
 	GROUP BY output_id
 )`).Scan(&size)
 	return size, err
+}
+
+func (c *catalog) listOutputs(ctx context.Context) ([]catalogOutput, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)
+FROM entries
+GROUP BY output_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	var outputs []catalogOutput
+	for rows.Next() {
+		var output catalogOutput
+		if err := rows.Scan(&output.outputID, &output.size, &output.compressedSize); err != nil {
+			return nil, err
+		}
+		outputs = append(outputs, output)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return outputs, nil
 }
 
 func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {

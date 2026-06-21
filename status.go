@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gofrs/flock"
@@ -21,6 +22,7 @@ type cacheStatus struct {
 	catalog          catalogStatus
 	blobFiles        int64
 	blobSize         int64
+	blobTypes        []blobTypeStatus
 	retainedFiles    int64
 	retainedSize     int64
 	activeLiveRuns   int64
@@ -41,55 +43,44 @@ func writeStatus(cfg config, w io.Writer) error {
 		return err
 	}
 
-	if _, err := fmt.Fprintf(w, "Cache directory: %s\n", status.cacheDir); err != nil {
-		return fmt.Errorf("write status: %w", err)
+	if err := writeTable(w, "Configuration", [][]string{
+		{"Cache directory", status.cacheDir},
+		{"Version directory", status.versionDir},
+		{"Max size", formatBytes(status.maxSize)},
+		{"Verbose", strconv.FormatBool(status.verbose)},
+	}); err != nil {
+		return err
 	}
-	if _, err := fmt.Fprintf(w, "Version directory: %s\n", status.versionDir); err != nil {
-		return fmt.Errorf("write status: %w", err)
+	catalogState := "missing"
+	if status.catalogExists {
+		catalogState = "present"
 	}
-	if _, err := fmt.Fprintf(w, "Max size: %s (%d bytes)\n", formatSize(status.maxSize), status.maxSize); err != nil {
-		return fmt.Errorf("write status: %w", err)
+	if err := writeTable(w, "Catalog", [][]string{
+		{"State", catalogState},
+		{"Entries", formatInt(status.catalog.entries)},
+		{"Outputs", formatInt(status.catalog.outputs)},
+		{"Uncompressed size", formatBytes(status.catalog.size)},
+		{"Compressed size", formatBytes(status.catalog.compressedSize)},
+		{"Savings", formatSavings(status.catalog.size, status.catalog.compressedSize)},
+		{"Runs", formatInt(status.catalog.runs)},
+	}); err != nil {
+		return err
 	}
-	if _, err := fmt.Fprintf(w, "Verbose: %t\n", status.verbose); err != nil {
-		return fmt.Errorf("write status: %w", err)
+	if err := writeTable(w, "Storage", [][]string{
+		{"Kind", "Files", "Size"},
+		{"Blobs", formatInt(status.blobFiles), formatBytes(status.blobSize)},
+		{"Retained files", formatInt(status.retainedFiles), formatBytes(status.retainedSize)},
+	}); err != nil {
+		return err
 	}
-	if !status.catalogExists {
-		if _, err := fmt.Fprintln(w, "Catalog: missing"); err != nil {
-			return fmt.Errorf("write status: %w", err)
-		}
-	} else {
-		if _, err := fmt.Fprintln(w, "Catalog: present"); err != nil {
-			return fmt.Errorf("write status: %w", err)
-		}
+	if err := writeBlobTypeStatus(w, status.blobTypes); err != nil {
+		return err
 	}
-	if _, err := fmt.Fprintf(w, "Entries: %d\n", status.catalog.entries); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Outputs: %d\n", status.catalog.outputs); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Catalog uncompressed size: %s (%d bytes)\n", formatSize(status.catalog.size), status.catalog.size); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Catalog compressed size: %s (%d bytes)\n", formatSize(status.catalog.compressedSize), status.catalog.compressedSize); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Catalog savings: %s\n", formatSavings(status.catalog.size, status.catalog.compressedSize)); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Catalog runs: %d\n", status.catalog.runs); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Blobs: %d files, %s (%d bytes)\n", status.blobFiles, formatSize(status.blobSize), status.blobSize); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Retained files: %d files, %s (%d bytes)\n", status.retainedFiles, formatSize(status.retainedSize), status.retainedSize); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	if _, err := fmt.Fprintf(w, "Live runs: %d active, %d inactive\n", status.activeLiveRuns, status.inactiveLiveRuns); err != nil {
-		return fmt.Errorf("write status: %w", err)
-	}
-	return nil
+	return writeTable(w, "Live runs", [][]string{
+		{"State", "Count"},
+		{"Active", formatInt(status.activeLiveRuns)},
+		{"Inactive", formatInt(status.inactiveLiveRuns)},
+	})
 }
 
 func readStatus(cfg config) (cacheStatus, error) {
@@ -120,6 +111,10 @@ func readStatus(cfg config) (cacheStatus, error) {
 			return err
 		}
 		status.blobFiles, status.blobSize, err = readBlobStatus(blobsDir)
+		if err != nil {
+			return err
+		}
+		status.blobTypes, err = readBlobTypeStatus(filepath.Join(versionDir, "cache.db"), blobsDir)
 		if err != nil {
 			return err
 		}
@@ -173,6 +168,91 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, error) {
 
 func readBlobStatus(blobsDir string) (int64, int64, error) {
 	return readSuffixedFileStatus(blobsDir, ".zst")
+}
+
+func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
+	if len(statuses) == 0 {
+		return writeTable(w, "Blob types (best effort)", [][]string{
+			{"Type", "Files", "Uncompressed", "Compressed", "Extra"},
+			{"None", "0", formatBytes(0), formatBytes(0), ""},
+		})
+	}
+	rows := [][]string{
+		{"Type", "Files", "Uncompressed", "Compressed", "Extra"},
+	}
+	for _, status := range statuses {
+		extra := ""
+		if status.exportDataSize > 0 {
+			extra = "export data: " + formatBytes(status.exportDataSize)
+		}
+		rows = append(rows, []string{
+			status.kind.label(),
+			formatInt(status.count),
+			formatBytes(status.size),
+			formatBytes(status.compressedSize),
+			extra,
+		})
+	}
+	return writeTable(w, "Blob types (best effort)", rows)
+}
+
+func writeTable(w io.Writer, title string, rows [][]string) error {
+	if _, err := fmt.Fprintf(w, "%s:\n", title); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	widths := tableWidths(rows)
+	for _, row := range rows {
+		if _, err := fmt.Fprint(w, "  "); err != nil {
+			return fmt.Errorf("write status: %w", err)
+		}
+		last := len(row) - 1
+		for last > 0 && row[last] == "" {
+			last--
+		}
+		for i, cell := range row[:last+1] {
+			if i > 0 {
+				if _, err := fmt.Fprint(w, "  "); err != nil {
+					return fmt.Errorf("write status: %w", err)
+				}
+			}
+			if _, err := fmt.Fprint(w, cell); err != nil {
+				return fmt.Errorf("write status: %w", err)
+			}
+			if i < last {
+				if _, err := fmt.Fprint(w, strings.Repeat(" ", widths[i]-len(cell))); err != nil {
+					return fmt.Errorf("write status: %w", err)
+				}
+			}
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return fmt.Errorf("write status: %w", err)
+		}
+	}
+	if _, err := fmt.Fprintln(w); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	return nil
+}
+
+func tableWidths(rows [][]string) []int {
+	var widths []int
+	for _, row := range rows {
+		for i, cell := range row {
+			if i >= len(widths) {
+				widths = append(widths, 0)
+			}
+			widths[i] = max(widths[i], len(cell))
+		}
+	}
+	return widths
+}
+
+func formatBytes(size int64) string {
+	return fmt.Sprintf("%s (%d bytes)", formatSize(size), size)
+}
+
+func formatInt(n int64) string {
+	return strconv.FormatInt(n, 10)
 }
 
 func readRetainedStatus(root string) (int64, int64, error) {
