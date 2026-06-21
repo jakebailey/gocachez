@@ -83,18 +83,20 @@ WHERE run_id = ?`, runID)
 
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
 	_, err := c.db.ExecContext(ctx, `
-INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO entries(action_id, output_id, size, compressed_size, executable_name, created_at, accessed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(action_id) DO UPDATE SET
 	output_id = excluded.output_id,
 	size = excluded.size,
 	compressed_size = excluded.compressed_size,
+	executable_name = excluded.executable_name,
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at`,
 		ent.ActionID,
 		ent.OutputID,
 		ent.Size,
 		ent.CompressedSize,
+		ent.ExecutableName,
 		unixMillis(ent.CreatedAt),
 		unixMillis(ent.AccessedAt),
 	)
@@ -105,13 +107,14 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, erro
 	var ent entry
 	var createdAt, accessedAt int64
 	err := c.db.QueryRowContext(ctx, `
-SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
+SELECT action_id, output_id, size, compressed_size, executable_name, created_at, accessed_at
 FROM entries
 WHERE action_id = ?`, actionID).Scan(
 		&ent.ActionID,
 		&ent.OutputID,
 		&ent.Size,
 		&ent.CompressedSize,
+		&ent.ExecutableName,
 		&createdAt,
 		&accessedAt,
 	)

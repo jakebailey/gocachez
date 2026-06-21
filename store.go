@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS entries (
 	output_id TEXT NOT NULL,
 	size INTEGER NOT NULL,
 	compressed_size INTEGER NOT NULL,
+	executable_name TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL
 );
@@ -45,6 +46,7 @@ type entry struct {
 	OutputID       string
 	Size           int64
 	CompressedSize int64
+	ExecutableName string
 	CreatedAt      time.Time
 	AccessedAt     time.Time
 }
@@ -225,10 +227,52 @@ func initDB(db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, catalogSchema); err != nil {
 		return fmt.Errorf("initialize catalog: %w", err)
 	}
+	if err := ensureCatalogColumns(ctx, db); err != nil {
+		return err
+	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, cacheSchemaVersion)); err != nil {
 		return fmt.Errorf("write catalog version: %w", err)
 	}
 	return nil
+}
+
+func ensureCatalogColumns(ctx context.Context, db *sql.DB) error {
+	hasExecutableName, err := columnExists(ctx, db, "entries", "executable_name")
+	if err != nil {
+		return err
+	}
+	if !hasExecutableName {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE entries ADD COLUMN executable_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add executable name column: %w", err)
+		}
+	}
+	return nil
+}
+
+func columnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, fmt.Errorf("read table info: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck
+
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("scan table info: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read table info: %w", err)
+	}
+	return false, nil
 }
 
 func (st *store) close() {

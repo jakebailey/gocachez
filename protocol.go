@@ -19,10 +19,11 @@ import (
 type command string
 
 const (
-	cmdPut     command = "put"
-	cmdPutPath command = "put-path"
-	cmdGet     command = "get"
-	cmdClose   command = "close"
+	cmdPut           command = "put"
+	cmdPutPath       command = "put-path"
+	cmdPutExecutable command = "put-executable"
+	cmdGet           command = "get"
+	cmdClose         command = "close"
 )
 
 type runMode string
@@ -34,12 +35,13 @@ const (
 )
 
 type request struct {
-	ID         int64
-	Command    command
-	ActionID   []byte `json:",omitempty"`
-	OutputID   []byte `json:",omitempty"`
-	BodySize   int64  `json:",omitempty"`
-	SourcePath string `json:",omitempty"`
+	ID             int64
+	Command        command
+	ActionID       []byte `json:",omitempty"`
+	OutputID       []byte `json:",omitempty"`
+	BodySize       int64  `json:",omitempty"`
+	SourcePath     string `json:",omitempty"`
+	ExecutableName string `json:",omitempty"`
 }
 
 type response struct {
@@ -87,7 +89,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 
 	rw := &responseWriter{enc: json.NewEncoder(stdout)}
 	if err := rw.write(response{
-		KnownCommands: []command{cmdGet, cmdPut, cmdPutPath, cmdClose},
+		KnownCommands: []command{cmdGet, cmdPut, cmdPutPath, cmdPutExecutable, cmdClose},
 	}); err != nil {
 		return err
 	}
@@ -238,7 +240,7 @@ func (st *store) handle(req request, br *bufio.Reader) response {
 	res := response{ID: req.ID}
 	var err error
 	switch req.Command {
-	case cmdPut:
+	case cmdPut, cmdPutExecutable:
 		res, err = st.put(req, br)
 	case cmdPutPath:
 		res, err = st.putPath(req)

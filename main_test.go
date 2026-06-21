@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +131,78 @@ func TestStorePutPathGet(t *testing.T) {
 	}
 	if !bytes.Equal(getRes.OutputID, outputID) {
 		t.Fatalf("OutputID = %x, want %x", getRes.OutputID, outputID)
+	}
+}
+
+func TestStorePutGetExecutable(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	body := []byte{0x7f, 'E', 'L', 'F', 1, 2, 3}
+	actionID := bytes.Repeat([]byte{73}, 32)
+	outputID := bytes.Repeat([]byte{74}, 32)
+	putRes, err := st.put(request{
+		ID:             1,
+		Command:        cmdPutExecutable,
+		ActionID:       actionID,
+		OutputID:       outputID,
+		BodySize:       int64(len(body)),
+		ExecutableName: "hello-tool",
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(putRes.DiskPath) != "hello-tool" {
+		t.Fatalf("put DiskPath = %q, want executable name", putRes.DiskPath)
+	}
+	assertExecutableFile(t, putRes.DiskPath)
+	gotBody, err := os.ReadFile(putRes.DiskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("put body = %q, want %q", gotBody, body)
+	}
+	ent, err := st.lookupEntry(hexOf(actionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ent.ExecutableName != "hello-tool" {
+		t.Fatalf("ExecutableName = %q, want hello-tool", ent.ExecutableName)
+	}
+
+	if err := os.Remove(putRes.DiskPath); err != nil {
+		t.Fatal(err)
+	}
+	getRes, err := st.get(request{
+		ID:       2,
+		Command:  cmdGet,
+		ActionID: actionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getRes.Miss {
+		t.Fatal("get missed")
+	}
+	if filepath.Base(getRes.DiskPath) != "hello-tool" {
+		t.Fatalf("get DiskPath = %q, want executable name", getRes.DiskPath)
+	}
+	assertExecutableFile(t, getRes.DiskPath)
+	gotBody, err = os.ReadFile(getRes.DiskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("get body = %q, want %q", gotBody, body)
 	}
 }
 
@@ -375,6 +448,32 @@ func TestCacheRejectsInvalidRequests(t *testing.T) {
 		ActionID: bytes.Repeat([]byte{1}, 32),
 	}, bufio.NewReader(nil)); err == nil {
 		t.Fatal("put accepted missing OutputID")
+	}
+	if _, err := st.put(request{
+		ID:             1,
+		Command:        cmdPut,
+		ActionID:       bytes.Repeat([]byte{1}, 32),
+		OutputID:       bytes.Repeat([]byte{2}, 32),
+		ExecutableName: "tool",
+	}, bufio.NewReader(nil)); err == nil {
+		t.Fatal("put accepted ExecutableName")
+	}
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPutExecutable,
+		ActionID: bytes.Repeat([]byte{1}, 32),
+		OutputID: bytes.Repeat([]byte{2}, 32),
+	}, bufio.NewReader(nil)); err == nil {
+		t.Fatal("put-executable accepted missing ExecutableName")
+	}
+	if _, err := st.put(request{
+		ID:             1,
+		Command:        cmdPutExecutable,
+		ActionID:       bytes.Repeat([]byte{1}, 32),
+		OutputID:       bytes.Repeat([]byte{2}, 32),
+		ExecutableName: "bad/name",
+	}, bufio.NewReader(nil)); err == nil {
+		t.Fatal("put-executable accepted invalid ExecutableName")
 	}
 	if _, err := st.put(request{
 		ID:       1,
@@ -1267,7 +1366,7 @@ func TestRunProtocol(t *testing.T) {
 	if err := dec.Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 4 {
+	if len(hello.KnownCommands) != 5 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
 	}
 	var putRes response
@@ -1329,7 +1428,7 @@ func TestRunReturnsAfterEOF(t *testing.T) {
 	if err := json.NewDecoder(&stdout).Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 4 {
+	if len(hello.KnownCommands) != 5 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
 	}
 }
@@ -2385,6 +2484,23 @@ func assertNonEmptyFile(t *testing.T, path string) {
 	}
 	if info.Size() == 0 {
 		t.Fatalf("%s is empty", path)
+	}
+}
+
+func assertExecutableFile(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("%s is not regular: %v", path, info.Mode())
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("%s mode = %v, want executable", path, info.Mode())
 	}
 }
 

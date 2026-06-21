@@ -36,6 +36,10 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
+	executableName, err := parseExecutableName(req)
+	if err != nil {
+		return response{}, err
+	}
 	body, err := bodyReader(br, req.BodySize)
 	if err != nil {
 		return response{}, err
@@ -52,7 +56,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		return response{}, fmt.Errorf("create blob dir: %w", err)
 	}
 
-	bodyPath, err := st.createLiveFile(outputHex)
+	bodyPath, err := st.createLiveFile(outputHex, executableName)
 	if err != nil {
 		return response{}, err
 	}
@@ -99,6 +103,11 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if bodyCloseErr != nil {
 		return response{}, fmt.Errorf("close live file: %w", bodyCloseErr)
 	}
+	if executableName != "" {
+		if err := os.Chmod(bodyPath, 0o777); err != nil {
+			return response{}, fmt.Errorf("chmod live executable: %w", err)
+		}
+	}
 	if blobCloseErr != nil {
 		return response{}, fmt.Errorf("close compressed file: %w", blobCloseErr)
 	}
@@ -117,6 +126,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		OutputID:       outputHex,
 		Size:           written,
 		CompressedSize: compressedSize,
+		ExecutableName: executableName,
 		CreatedAt:      now,
 		AccessedAt:     now,
 	}
@@ -329,7 +339,7 @@ func (st *store) flushAccessTimes() error {
 }
 
 func (st *store) materialize(ent entry) (string, error) {
-	bodyPath, err := st.createLiveFile(ent.OutputID)
+	bodyPath, err := st.createLiveFile(ent.OutputID, ent.ExecutableName)
 	if err != nil {
 		return "", err
 	}
@@ -352,7 +362,7 @@ func (st *store) materialize(ent entry) (string, error) {
 	}
 	defer st.putDecoder(zr)
 
-	bodyFile, err := os.Create(bodyPath)
+	bodyFile, err := os.OpenFile(bodyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, liveFileMode(ent.ExecutableName))
 	if err != nil {
 		return "", fmt.Errorf("create live file: %w", err)
 	}
@@ -364,6 +374,11 @@ func (st *store) materialize(ent entry) (string, error) {
 	}
 	if closeErr != nil {
 		return "", fmt.Errorf("close live file: %w", closeErr)
+	}
+	if ent.ExecutableName != "" {
+		if err := os.Chmod(bodyPath, 0o777); err != nil {
+			return "", fmt.Errorf("chmod live executable: %w", err)
+		}
 	}
 	if written != ent.Size {
 		return "", fmt.Errorf("%w: decompressed size mismatch: got %d bytes, expected %d", errInvalidCacheEntry, written, ent.Size)
@@ -402,7 +417,14 @@ func (st *store) putDecoder(dec *zstd.Decoder) {
 	st.decoderPool.Put(dec)
 }
 
-func (st *store) createLiveFile(outputHex string) (string, error) {
+func (st *store) createLiveFile(outputHex, executableName string) (string, error) {
+	if executableName != "" {
+		dir, err := os.MkdirTemp(st.runDir, outputHex+"-exe-*")
+		if err != nil {
+			return "", fmt.Errorf("create live executable dir: %w", err)
+		}
+		return filepath.Join(dir, executableName), nil
+	}
 	file, err := os.CreateTemp(st.runDir, outputHex+"-*")
 	if err != nil {
 		return "", fmt.Errorf("create live file: %w", err)
@@ -413,6 +435,33 @@ func (st *store) createLiveFile(outputHex string) (string, error) {
 		return "", fmt.Errorf("close live file placeholder: %w", err)
 	}
 	return path, nil
+}
+
+func parseExecutableName(req request) (string, error) {
+	if req.Command != cmdPutExecutable {
+		if req.ExecutableName != "" {
+			return "", errors.New("ExecutableName requires put-executable")
+		}
+		return "", nil
+	}
+	if req.ExecutableName == "" {
+		return "", errors.New("missing ExecutableName")
+	}
+	if strings.ContainsAny(req.ExecutableName, `/\`) ||
+		strings.ContainsRune(req.ExecutableName, 0) ||
+		req.ExecutableName == "." ||
+		req.ExecutableName == ".." ||
+		filepath.IsAbs(req.ExecutableName) {
+		return "", fmt.Errorf("invalid ExecutableName %q", req.ExecutableName)
+	}
+	return req.ExecutableName, nil
+}
+
+func liveFileMode(executableName string) os.FileMode {
+	if executableName != "" {
+		return 0o777
+	}
+	return 0o666
 }
 
 func (st *store) installBlob(tmpPath, outputHex string) (int64, error) {
