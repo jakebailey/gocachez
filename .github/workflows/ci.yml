@@ -73,17 +73,22 @@ jobs:
         with:
           go-version: stable
 
-      - name: Smoke test GOCACHEPROG
+      - name: Configure GOCACHEPROG
         run: |
           set -euo pipefail
 
           export GOBIN="$RUNNER_TEMP/bin"
           mkdir -p "$GOBIN"
           go install .
-          export PATH="$GOBIN:$PATH"
-          export GOCACHEZ_DIR="$RUNNER_TEMP/gocachez"
+          echo "$GOBIN" >> "$GITHUB_PATH"
+          echo "GOCACHEZ_DIR=$RUNNER_TEMP/gocachez" >> "$GITHUB_ENV"
           go env -w GOCACHE="$RUNNER_TEMP/go-build"
           go env -w GOCACHEPROG=gocachez
+
+      - name: Smoke test std and cmd
+        run: |
+          set -euo pipefail
+
           go test -run '^$' -count=1 std cmd
 
       - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
