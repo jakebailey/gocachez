@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -458,9 +459,9 @@ func removeEmptyDirs(root string) error {
 	}); err != nil {
 		return err
 	}
-	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := os.Remove(dirs[i]); err != nil && !errors.Is(err, os.ErrNotExist) {
-			if entries, readErr := os.ReadDir(dirs[i]); readErr != nil || len(entries) != 0 {
+	for _, dir := range slices.Backward(dirs) {
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) != 0 {
 				continue
 			}
 		}

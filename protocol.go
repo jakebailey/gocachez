@@ -87,12 +87,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 		switch req.Command {
 		case cmdGet:
 			sem <- struct{}{}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				defer func() { <-sem }()
 				_ = rw.write(st.handle(req, nil))
-			}()
+			})
 		case cmdClose:
 			wg.Wait()
 			if err := rw.write(st.handle(req, nil)); err != nil {
