@@ -231,7 +231,32 @@ func bodyReader(br *bufio.Reader, size int64) (io.Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return base64.NewDecoder(base64.StdEncoding, raw), nil
+	return &bodyStream{
+		decoded: base64.NewDecoder(base64.StdEncoding, raw),
+		raw:     raw,
+	}, nil
+}
+
+type bodyStream struct {
+	decoded io.Reader
+	raw     *jsonStringReader
+}
+
+func (r *bodyStream) Read(p []byte) (int, error) {
+	return r.decoded.Read(p)
+}
+
+func (r *bodyStream) drain() error {
+	_, err := io.Copy(io.Discard, r.raw)
+	return err
+}
+
+func drainBody(r io.Reader) error {
+	if drainer, ok := r.(interface{ drain() error }); ok {
+		return drainer.drain()
+	}
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 type jsonStringReader struct {
@@ -240,7 +265,7 @@ type jsonStringReader struct {
 	done    bool
 }
 
-func newJSONStringReader(br *bufio.Reader) (io.Reader, error) {
+func newJSONStringReader(br *bufio.Reader) (*jsonStringReader, error) {
 	if err := skipWhitespace(br); err != nil {
 		return nil, err
 	}

@@ -38,6 +38,12 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
+	bodyDrained := false
+	defer func() {
+		if !bodyDrained {
+			_ = drainBody(body)
+		}
+	}()
 
 	blobDir := st.blobDir(outputHex)
 	if err := os.MkdirAll(blobDir, 0o777); err != nil {
@@ -84,6 +90,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if copyErr != nil {
 		return response{}, fmt.Errorf("read put body: %w", copyErr)
 	}
+	bodyDrained = true
 	if closeErr != nil {
 		return response{}, fmt.Errorf("finish zstd stream: %w", closeErr)
 	}
@@ -342,6 +349,10 @@ func (st *store) deleteOutput(outputID string) error {
 }
 
 func (st *store) prune() error {
+	return st.withLifecycleLock(st.pruneLocked)
+}
+
+func (st *store) pruneLocked() error {
 	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
 		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 	}

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 func TestStorePutGet(t *testing.T) {
@@ -346,6 +348,48 @@ func TestCacheRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestPutDrainsBodyOnSetupError(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	notDir := filepath.Join(t.TempDir(), "not-dir")
+	if err := os.WriteFile(notDir, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	st.blobsDir = notDir
+
+	var input bytes.Buffer
+	input.Write(encodedBody([]byte("body")).Bytes())
+	writeJSON(t, &input, request{ID: 2, Command: cmdClose})
+	br := bufio.NewReader(&input)
+
+	_, err = st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{41}, 32),
+		OutputID: bytes.Repeat([]byte{42}, 32),
+		BodySize: 4,
+	}, br)
+	if err == nil {
+		t.Fatal("put succeeded with invalid blobs dir")
+	}
+
+	req, err := readRequest(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ID != 2 || req.Command != cmdClose {
+		t.Fatalf("next request = %+v, want close request", req)
+	}
+}
+
 func TestEncoderAndDecoderPools(t *testing.T) {
 	t.Parallel()
 
@@ -635,6 +679,84 @@ func TestPruneKeepsLiveBlobs(t *testing.T) {
 	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
 		t.Fatalf("live blob was pruned: %v", err)
 	}
+}
+
+func TestPruneUsesLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	done := make(chan error, 1)
+	go func() {
+		done <- st.prune()
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("prune finished while lifecycle lock was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewStoreUsesLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cacheDir, "v1"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	type result struct {
+		st  *store
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		st, err := newStore(config{dir: cacheDir})
+		done <- result{st: st, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.st != nil {
+			res.st.close()
+		}
+		t.Fatalf("newStore finished while lifecycle lock was held: %v", res.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	res := <-done
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	res.st.close()
 }
 
 func TestPruneRemovesUnusedBlobs(t *testing.T) {

@@ -51,19 +51,20 @@ type entry struct {
 type store struct {
 	config
 
-	db           *sql.DB
-	q            *catalog
-	versionDir   string
-	blobsDir     string
-	liveRoot     string
-	runID        string
-	runDir       string
-	runLock      *flock.Flock
-	mu           sync.Mutex
-	encoderPool  sync.Pool
-	decoderPool  sync.Pool
-	materialized map[string]string
-	accessed     map[string]int64
+	db                *sql.DB
+	q                 *catalog
+	versionDir        string
+	blobsDir          string
+	liveRoot          string
+	lifecycleLockPath string
+	runID             string
+	runDir            string
+	runLock           *flock.Flock
+	mu                sync.Mutex
+	encoderPool       sync.Pool
+	decoderPool       sync.Pool
+	materialized      map[string]string
+	accessed          map[string]int64
 }
 
 func newStore(cfg config) (*store, error) {
@@ -96,19 +97,20 @@ func newStore(cfg config) (*store, error) {
 		return nil, err
 	}
 	st := &store{
-		config:       cfg,
-		db:           db,
-		q:            newCatalog(db),
-		versionDir:   versionDir,
-		blobsDir:     blobsDir,
-		liveRoot:     liveRoot,
-		runID:        runID,
-		runDir:       runDir,
-		runLock:      runLock,
-		materialized: make(map[string]string),
-		accessed:     make(map[string]int64),
+		config:            cfg,
+		db:                db,
+		q:                 newCatalog(db),
+		versionDir:        versionDir,
+		blobsDir:          blobsDir,
+		liveRoot:          liveRoot,
+		lifecycleLockPath: filepath.Join(versionDir, "lifecycle.lock"),
+		runID:             runID,
+		runDir:            runDir,
+		runLock:           runLock,
+		materialized:      make(map[string]string),
+		accessed:          make(map[string]int64),
 	}
-	if err := st.registerRun(); err != nil {
+	if err := st.withLifecycleLock(st.registerRun); err != nil {
 		_ = db.Close()
 		_ = runLock.Unlock()
 		_ = runLock.Close()
@@ -119,6 +121,24 @@ func newStore(cfg config) (*store, error) {
 		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 	}
 	return st, nil
+}
+
+func (st *store) withLifecycleLock(fn func() error) error {
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		_ = lock.Close()
+		return fmt.Errorf("lock cache lifecycle: %w", err)
+	}
+
+	var err error
+	err = errors.Join(err, fn())
+	if unlockErr := lock.Unlock(); unlockErr != nil {
+		err = errors.Join(err, fmt.Errorf("unlock cache lifecycle: %w", unlockErr))
+	}
+	if closeErr := lock.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close cache lifecycle lock: %w", closeErr))
+	}
+	return err
 }
 
 func openDB(path string) (*sql.DB, error) {
