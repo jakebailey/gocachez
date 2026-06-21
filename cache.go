@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -128,6 +129,108 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	return response{
 		ID:       req.ID,
 		DiskPath: bodyPath,
+	}, nil
+}
+
+func (st *store) putPath(req request) (response, error) {
+	actionHex, err := idHex("ActionID", req.ActionID)
+	if err != nil {
+		return response{}, err
+	}
+	outputHex, err := idHex("OutputID", req.OutputID)
+	if err != nil {
+		return response{}, err
+	}
+	if req.SourcePath == "" {
+		return response{}, errors.New("put-path missing SourcePath")
+	}
+	sourcePath, err := filepath.Abs(req.SourcePath)
+	if err != nil {
+		return response{}, fmt.Errorf("resolve SourcePath: %w", err)
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return response{}, fmt.Errorf("stat SourcePath: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return response{}, fmt.Errorf("SourcePath is not a regular file: %s", sourcePath)
+	}
+	if info.Size() != req.BodySize {
+		return response{}, fmt.Errorf("put-path body size mismatch: source has %d bytes, expected %d", info.Size(), req.BodySize)
+	}
+
+	blobDir := st.blobDir(outputHex)
+	if err := os.MkdirAll(blobDir, 0o777); err != nil {
+		return response{}, fmt.Errorf("create blob dir: %w", err)
+	}
+	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
+	if err != nil {
+		return response{}, fmt.Errorf("create compressed file: %w", err)
+	}
+	blobTmpPath := blobTmp.Name()
+	defer func() {
+		_ = os.Remove(blobTmpPath)
+	}()
+
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		_ = blobTmp.Close()
+		return response{}, fmt.Errorf("open SourcePath: %w", err)
+	}
+	zw, err := st.getEncoder(blobTmp)
+	if err != nil {
+		_ = sourceFile.Close()
+		_ = blobTmp.Close()
+		return response{}, fmt.Errorf("create zstd encoder: %w", err)
+	}
+
+	hash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(zw, hash), sourceFile)
+	closeErr := zw.Close()
+	st.putEncoder(zw)
+	sourceCloseErr := sourceFile.Close()
+	blobCloseErr := blobTmp.Close()
+	if copyErr != nil {
+		return response{}, fmt.Errorf("read SourcePath: %w", copyErr)
+	}
+	if closeErr != nil {
+		return response{}, fmt.Errorf("finish zstd stream: %w", closeErr)
+	}
+	if sourceCloseErr != nil {
+		return response{}, fmt.Errorf("close SourcePath: %w", sourceCloseErr)
+	}
+	if blobCloseErr != nil {
+		return response{}, fmt.Errorf("close compressed file: %w", blobCloseErr)
+	}
+	if written != req.BodySize {
+		return response{}, fmt.Errorf("put-path body size mismatch: got %d bytes, expected %d", written, req.BodySize)
+	}
+	if got := hex.EncodeToString(hash.Sum(nil)); got != outputHex {
+		return response{}, fmt.Errorf("put-path checksum mismatch: got %s, expected %s", got, outputHex)
+	}
+
+	compressedSize, err := st.installBlob(blobTmpPath, outputHex)
+	if err != nil {
+		return response{}, err
+	}
+
+	now := time.Now()
+	ent := entry{
+		ActionID:       actionHex,
+		OutputID:       outputHex,
+		Size:           written,
+		CompressedSize: compressedSize,
+		CreatedAt:      now,
+		AccessedAt:     now,
+	}
+	if err := st.upsertEntry(ent); err != nil {
+		return response{}, err
+	}
+	st.setMaterialized(outputHex, sourcePath)
+
+	return response{
+		ID:       req.ID,
+		DiskPath: sourcePath,
 	}, nil
 }
 

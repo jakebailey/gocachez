@@ -84,6 +84,55 @@ func TestStorePutGet(t *testing.T) {
 	}
 }
 
+func TestStorePutPathGet(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	body := []byte("hello from put-path")
+	sourcePath := filepath.Join(t.TempDir(), "artifact")
+	if err := os.WriteFile(sourcePath, body, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	actionID := bytes.Repeat([]byte{32}, 32)
+	outputID := sha256Sum(body)
+	res, err := st.putPath(request{
+		ID:         1,
+		Command:    cmdPutPath,
+		ActionID:   actionID,
+		OutputID:   outputID,
+		BodySize:   int64(len(body)),
+		SourcePath: sourcePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DiskPath != sourcePath {
+		t.Fatalf("put-path DiskPath = %q, want %q", res.DiskPath, sourcePath)
+	}
+
+	getRes, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if getRes.Miss {
+		t.Fatal("get missed")
+	}
+	if getRes.DiskPath != sourcePath {
+		t.Fatalf("get DiskPath = %q, want source path %q", getRes.DiskPath, sourcePath)
+	}
+	if !bytes.Equal(getRes.OutputID, outputID) {
+		t.Fatalf("OutputID = %x, want %x", getRes.OutputID, outputID)
+	}
+}
+
 func TestGetMiss(t *testing.T) {
 	t.Parallel()
 
@@ -1218,7 +1267,7 @@ func TestRunProtocol(t *testing.T) {
 	if err := dec.Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 3 {
+	if len(hello.KnownCommands) != 4 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
 	}
 	var putRes response
@@ -1280,7 +1329,7 @@ func TestRunReturnsAfterEOF(t *testing.T) {
 	if err := json.NewDecoder(&stdout).Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 3 {
+	if len(hello.KnownCommands) != 4 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
 	}
 }

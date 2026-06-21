@@ -19,9 +19,10 @@ import (
 type command string
 
 const (
-	cmdPut   command = "put"
-	cmdGet   command = "get"
-	cmdClose command = "close"
+	cmdPut     command = "put"
+	cmdPutPath command = "put-path"
+	cmdGet     command = "get"
+	cmdClose   command = "close"
 )
 
 type runMode string
@@ -33,11 +34,12 @@ const (
 )
 
 type request struct {
-	ID       int64
-	Command  command
-	ActionID []byte `json:",omitempty"`
-	OutputID []byte `json:",omitempty"`
-	BodySize int64  `json:",omitempty"`
+	ID         int64
+	Command    command
+	ActionID   []byte `json:",omitempty"`
+	OutputID   []byte `json:",omitempty"`
+	BodySize   int64  `json:",omitempty"`
+	SourcePath string `json:",omitempty"`
 }
 
 type response struct {
@@ -85,7 +87,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 
 	rw := &responseWriter{enc: json.NewEncoder(stdout)}
 	if err := rw.write(response{
-		KnownCommands: []command{cmdGet, cmdPut, cmdClose},
+		KnownCommands: []command{cmdGet, cmdPut, cmdPutPath, cmdClose},
 	}); err != nil {
 		return err
 	}
@@ -238,6 +240,8 @@ func (st *store) handle(req request, br *bufio.Reader) response {
 	switch req.Command {
 	case cmdPut:
 		res, err = st.put(req, br)
+	case cmdPutPath:
+		res, err = st.putPath(req)
 	case cmdGet:
 		res, err = st.get(req)
 	case cmdClose:
