@@ -61,6 +61,7 @@ jobs:
       - uses: golangci/golangci-lint-action@db582008a42febd596419635a5abc9d9815daa9c # v9.2.1
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
+          cache: false
 
   format:
     name: format
