@@ -5,6 +5,9 @@ helper for the Go build cache. It stores cache artifacts as zstd-compressed
 files, materializes uncompressed files for the Go command on demand, and evicts
 old compressed entries automatically.
 
+This project was inspired by the discussion on
+[`golang/go#76337`](https://github.com/golang/go/issues/76337).
+
 Go `std`:
 
 | Mode             |        Cold time |       Warm time | Disk usage |
