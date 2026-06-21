@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
@@ -62,22 +64,7 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 		return nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
 
-	byKind := make(map[blobTypeKind]*blobTypeStatus)
-	for _, output := range outputs {
-		classification := classifyCompressedBlob(blobPath(blobsDir, output.outputID))
-		status := byKind[classification.kind]
-		if status == nil {
-			status = &blobTypeStatus{
-				kind: classification.kind,
-			}
-			byKind[classification.kind] = status
-		}
-		status.count++
-		status.size += output.size
-		status.compressedSize += output.compressedSize
-		status.exportDataSize += classification.exportDataSize
-	}
-
+	byKind := classifyBlobTypes(blobsDir, outputs)
 	statuses := make([]blobTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
 		statuses = append(statuses, *status)
@@ -91,24 +78,93 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 	return statuses, nil
 }
 
-func classifyCompressedBlob(path string) blobClassification {
+type blobTypeResult struct {
+	output         catalogOutput
+	classification blobClassification
+}
+
+func classifyBlobTypes(blobsDir string, outputs []catalogOutput) map[blobTypeKind]*blobTypeStatus {
+	byKind := make(map[blobTypeKind]*blobTypeStatus)
+	if len(outputs) == 0 {
+		return byKind
+	}
+
+	workers := min(len(outputs), min(max(runtime.GOMAXPROCS(0), 1), 8))
+	jobs := make(chan catalogOutput)
+	results := make(chan blobTypeResult, workers)
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			var decoder *zstd.Decoder
+			defer func() {
+				if decoder != nil {
+					decoder.Close()
+				}
+			}()
+			for output := range jobs {
+				var classification blobClassification
+				classification, decoder = classifyCompressedBlob(blobPath(blobsDir, output.outputID), decoder)
+				results <- blobTypeResult{
+					output:         output,
+					classification: classification,
+				}
+			}
+		})
+	}
+
+	go func() {
+		for _, output := range outputs {
+			jobs <- output
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		output := result.output
+		classification := result.classification
+		status := byKind[classification.kind]
+		if status == nil {
+			status = &blobTypeStatus{
+				kind: classification.kind,
+			}
+			byKind[classification.kind] = status
+		}
+		status.count++
+		status.size += output.size
+		status.compressedSize += output.compressedSize
+		status.exportDataSize += classification.exportDataSize
+	}
+	return byKind
+}
+
+func classifyCompressedBlob(path string, decoder *zstd.Decoder) (blobClassification, *zstd.Decoder) {
 	file, err := os.Open(path)
 	if err != nil {
-		return blobClassification{kind: blobTypeUnreadable}
+		return blobClassification{kind: blobTypeUnreadable}, decoder
 	}
 	defer file.Close() //nolint:errcheck
 
-	zr, err := zstd.NewReader(file, decoderOptions...)
-	if err != nil {
-		return blobClassification{kind: blobTypeUnreadable}
+	if decoder == nil {
+		decoder, err = zstd.NewReader(file, decoderOptions...)
+	} else {
+		err = decoder.Reset(file)
 	}
-	defer zr.Close()
+	if err != nil {
+		if decoder != nil {
+			decoder.Close()
+		}
+		return blobClassification{kind: blobTypeUnreadable}, nil
+	}
 
-	data, err := io.ReadAll(io.LimitReader(zr, blobTypePrefixLimit))
+	data, err := io.ReadAll(io.LimitReader(decoder, blobTypePrefixLimit))
 	if err != nil {
-		return blobClassification{kind: blobTypeUnreadable}
+		decoder.Close()
+		return blobClassification{kind: blobTypeUnreadable}, nil
 	}
-	return classifyBlobData(data)
+	return classifyBlobData(data), decoder
 }
 
 func classifyBlobData(data []byte) blobClassification {
