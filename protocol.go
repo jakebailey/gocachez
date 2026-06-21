@@ -23,6 +23,7 @@ const (
 	cmdPutPath       command = "put-path"
 	cmdPutExecutable command = "put-executable"
 	cmdGet           command = "get"
+	cmdCleanCache    command = "clean-cache"
 	cmdClose         command = "close"
 )
 
@@ -89,7 +90,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 
 	rw := &responseWriter{enc: json.NewEncoder(stdout)}
 	if err := rw.write(response{
-		KnownCommands: []command{cmdGet, cmdPut, cmdPutPath, cmdPutExecutable, cmdClose},
+		KnownCommands: []command{cmdGet, cmdPut, cmdPutPath, cmdPutExecutable, cmdCleanCache, cmdClose},
 	}); err != nil {
 		return err
 	}
@@ -246,6 +247,8 @@ func (st *store) handle(req request, br *bufio.Reader) response {
 		res, err = st.putPath(req)
 	case cmdGet:
 		res, err = st.get(req)
+	case cmdCleanCache:
+		err = st.cleanProtocolCache()
 	case cmdClose:
 	default:
 		err = fmt.Errorf("unknown command %q", req.Command)

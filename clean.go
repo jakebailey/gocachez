@@ -10,6 +10,34 @@ import (
 	"github.com/gofrs/flock"
 )
 
+func (st *store) cleanProtocolCache() error {
+	return st.withLifecycleLock(func() error {
+		if err := st.cleanupAbandonedRuns(); err != nil {
+			return err
+		}
+		activeRuns, err := st.q.countRuns(context.Background())
+		if err != nil {
+			return fmt.Errorf("count active runs: %w", err)
+		}
+		if activeRuns > 1 {
+			return nil
+		}
+		if err := os.RemoveAll(st.blobsDir); err != nil {
+			return fmt.Errorf("remove blobs dir: %w", err)
+		}
+		if err := os.RemoveAll(retainedRoot(st.versionDir)); err != nil {
+			return fmt.Errorf("remove retained dir: %w", err)
+		}
+		if _, err := st.db.ExecContext(context.Background(), `DELETE FROM entries`); err != nil {
+			return fmt.Errorf("delete catalog entries: %w", err)
+		}
+		st.mu.Lock()
+		st.materialized = make(map[string]string)
+		st.mu.Unlock()
+		return nil
+	})
+}
+
 func cleanCache(cfg config) error {
 	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if _, err := os.Stat(versionDir); errors.Is(err, os.ErrNotExist) {

@@ -1366,7 +1366,7 @@ func TestRunProtocol(t *testing.T) {
 	if err := dec.Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 5 {
+	if len(hello.KnownCommands) != 6 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
 	}
 	var putRes response
@@ -1428,8 +1428,73 @@ func TestRunReturnsAfterEOF(t *testing.T) {
 	if err := json.NewDecoder(&stdout).Decode(&hello); err != nil {
 		t.Fatal(err)
 	}
-	if len(hello.KnownCommands) != 5 {
+	if len(hello.KnownCommands) != 6 {
 		t.Fatalf("KnownCommands = %v", hello.KnownCommands)
+	}
+}
+
+func TestRunProtocolCleanCache(t *testing.T) {
+	t.Parallel()
+
+	actionID := bytes.Repeat([]byte{75}, 32)
+	outputID := bytes.Repeat([]byte{76}, 32)
+	body := []byte("clean me")
+
+	var stdin bytes.Buffer
+	writeJSON(t, &stdin, request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	})
+	stdin.WriteByte('\n')
+	writeJSON(t, &stdin, base64.StdEncoding.EncodeToString(body))
+	writeJSON(t, &stdin, request{ID: 2, Command: cmdCleanCache})
+	writeJSON(t, &stdin, request{
+		ID:       3,
+		Command:  cmdGet,
+		ActionID: actionID,
+	})
+	writeJSON(t, &stdin, request{ID: 4, Command: cmdClose})
+
+	var stdout bytes.Buffer
+	if err := run([]string{"-dir", t.TempDir(), "-max-size", "0"}, &stdin, &stdout); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := json.NewDecoder(&stdout)
+	var hello response
+	if err := dec.Decode(&hello); err != nil {
+		t.Fatal(err)
+	}
+	var putRes response
+	if err := dec.Decode(&putRes); err != nil {
+		t.Fatal(err)
+	}
+	if putRes.ID != 1 || putRes.Err != "" || putRes.DiskPath == "" {
+		t.Fatalf("put response = %+v", putRes)
+	}
+	var cleanRes response
+	if err := dec.Decode(&cleanRes); err != nil {
+		t.Fatal(err)
+	}
+	if cleanRes.ID != 2 || cleanRes.Err != "" {
+		t.Fatalf("clean response = %+v", cleanRes)
+	}
+	var getRes response
+	if err := dec.Decode(&getRes); err != nil {
+		t.Fatal(err)
+	}
+	if getRes.ID != 3 || getRes.Err != "" || !getRes.Miss {
+		t.Fatalf("get response = %+v", getRes)
+	}
+	var closeRes response
+	if err := dec.Decode(&closeRes); err != nil {
+		t.Fatal(err)
+	}
+	if closeRes.ID != 4 || closeRes.Err != "" {
+		t.Fatalf("close response = %+v", closeRes)
 	}
 }
 
