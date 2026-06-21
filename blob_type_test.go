@@ -36,6 +36,18 @@ func TestClassifyCompressedBlobReusesDecoderAfterPrefixRead(t *testing.T) {
 	}
 }
 
+func TestClassifyBlobDataRecognizesCCompilerID(t *testing.T) {
+	t.Parallel()
+
+	body := append([]byte("/usr/lib/ccache/bin/gcc\x00stat 1448536 1ed 2026-05-13 07:28:29 -0700 PDT false\n\x00"),
+		bytes.Repeat([]byte{0x86}, 32)...)
+
+	classification := classifyBlobData(body)
+	if classification.kind != blobTypeCCompilerID {
+		t.Fatalf("classification = %v, want %v", classification.kind, blobTypeCCompilerID)
+	}
+}
+
 func writeCompressedTestBlob(t *testing.T, path string, body []byte) {
 	t.Helper()
 

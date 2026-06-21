@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"unicode/utf8"
 
@@ -29,6 +30,7 @@ const (
 	blobTypeMachOBinary
 	blobTypePEBinary
 	blobTypeWasmBinary
+	blobTypeCCompilerID
 	blobTypeText
 	blobTypeEmpty
 	blobTypeUnknownBinary
@@ -201,6 +203,9 @@ func classifyBlobData(data []byte) blobClassification {
 	if hasMachOMagic(data) {
 		return blobClassification{kind: blobTypeMachOBinary}
 	}
+	if isCCompilerID(data) {
+		return blobClassification{kind: blobTypeCCompilerID}
+	}
 	if isLikelyText(data) {
 		if looksLikeGoSource(data) {
 			return blobClassification{kind: blobTypeGoSource}
@@ -224,6 +229,45 @@ func hasMachOMagic(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func isCCompilerID(data []byte) bool {
+	const idSize = 32
+	if len(data) <= idSize {
+		return false
+	}
+	metadata := data[:len(data)-idSize]
+	if len(metadata) == 0 || metadata[len(metadata)-1] != 0 {
+		return false
+	}
+
+	fields := bytes.Split(metadata[:len(metadata)-1], []byte{0})
+	if len(fields) == 0 || len(fields)%2 != 0 {
+		return false
+	}
+	for i := 0; i < len(fields); i += 2 {
+		if len(fields[i]) == 0 || !isCCompilerIDStat(fields[i+1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isCCompilerIDStat(data []byte) bool {
+	fields := bytes.Fields(data)
+	if len(fields) < 6 ||
+		!bytes.Equal(fields[0], []byte("stat")) ||
+		(!bytes.Equal(fields[len(fields)-1], []byte("true")) && !bytes.Equal(fields[len(fields)-1], []byte("false"))) ||
+		!bytes.HasSuffix(data, []byte("\n")) {
+		return false
+	}
+	if _, err := strconv.ParseInt(string(fields[1]), 10, 64); err != nil {
+		return false
+	}
+	if _, err := strconv.ParseUint(string(fields[2]), 16, 64); err != nil {
+		return false
+	}
+	return true
 }
 
 func looksLikeGoSource(data []byte) bool {
@@ -269,6 +313,8 @@ func (kind blobTypeKind) label() string {
 		return "PE binaries"
 	case blobTypeWasmBinary:
 		return "WebAssembly binaries"
+	case blobTypeCCompilerID:
+		return "C compiler IDs"
 	case blobTypeText:
 		return "Text files"
 	case blobTypeEmpty:
