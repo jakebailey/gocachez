@@ -322,7 +322,7 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 	if err != nil || retained {
 		return retained, err
 	}
-	return retainGeneratedCgoSource(path, st.retainedPath(outputID, ".go"))
+	return retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
 }
 
 func liveOutputID(path string) string {

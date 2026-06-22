@@ -100,14 +100,15 @@ Some live files can escape the Go command process through `go list` output. For
 example, `go list -export` reports an `Export` path that tools such as
 `go/packages` and `golangci-lint` may open after the Go command has closed its
 `GOCACHEPROG` helper. `go list -compiled` can also report generated cgo source
-paths in `CompiledGoFiles`.
+paths in `CompiledGoFiles`, and `go list -test` can report a generated
+`_testmain.go` path in the synthetic test main package's `GoFiles`.
 
 To support those tools without keeping large uncompressed archives around,
 `gocachez` treats these escaped files specially on close. Package archives are
 replaced with small archives containing only their `__.PKGDEF` export data, and
-generated cgo source files are retained as-is. These retained files are stored
-under `retained/`, keyed by output ID, and are cleaned up once no catalog entry
-references that output.
+generated Go source files that can appear in list output are retained as-is.
+These retained files are stored under `retained/`, keyed by output ID, and are
+cleaned up once no catalog entry references that output.
 
 ## Configuration
 
