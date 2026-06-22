@@ -193,24 +193,19 @@ func readBlobStatus(blobsDir string) (int64, int64, error) {
 func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 	if len(statuses) == 0 {
 		return writeRightAlignedTable(w, "Blob types (best effort)", [][]string{
-			{"Type", "Files", "Uncompressed", "Compressed", "Extra"},
-			{"None", "0", formatBytes(0), formatBytes(0), ""},
+			{"Type", "Files", "Uncompressed", "Compressed"},
+			{"None", "0", formatBytes(0), formatBytes(0)},
 		})
 	}
 	rows := [][]string{
-		{"Type", "Files", "Uncompressed", "Compressed", "Extra"},
+		{"Type", "Files", "Uncompressed", "Compressed"},
 	}
 	for _, status := range statuses {
-		extra := ""
-		if status.exportDataSize > 0 {
-			extra = "export data: " + formatBytes(status.exportDataSize)
-		}
 		rows = append(rows, []string{
 			status.kind.label(),
 			formatInt(status.count),
 			formatBytes(status.size),
 			formatBytes(status.compressedSize),
-			extra,
 		})
 	}
 	return writeRightAlignedTable(w, "Blob types (best effort)", rows)

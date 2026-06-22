@@ -48,12 +48,10 @@ type blobTypeStatus struct {
 	count          int64
 	size           int64
 	compressedSize int64
-	exportDataSize int64
 }
 
 type blobClassification struct {
-	kind           blobTypeKind
-	exportDataSize int64
+	kind blobTypeKind
 }
 
 func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
@@ -143,7 +141,6 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) map[blobTypeKin
 		status.count++
 		status.size += output.size
 		status.compressedSize += output.compressedSize
-		status.exportDataSize += classification.exportDataSize
 	}
 	return byKind
 }
@@ -179,11 +176,8 @@ func classifyBlobData(data []byte) blobClassification {
 	if len(data) == 0 {
 		return blobClassification{kind: blobTypeEmpty}
 	}
-	if exportDataSize, ok := packageArchiveExportSize(data); ok {
-		return blobClassification{
-			kind:           blobTypeGoPackageArchive,
-			exportDataSize: exportDataSize,
-		}
+	if _, ok := packageArchiveExportSize(data); ok {
+		return blobClassification{kind: blobTypeGoPackageArchive}
 	}
 	if bytes.HasPrefix(data, []byte("go index v")) {
 		return blobClassification{kind: blobTypeGoPackageIndex}

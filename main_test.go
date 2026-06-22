@@ -1669,7 +1669,6 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 	got := stdout.String()
 	assertContains(t, got, "Blob types (best effort):")
 	assertContains(t, got, "Go package archives        1")
-	assertContains(t, got, "export data: ")
 	assertContains(t, got, "Go package indexes         1")
 	assertContains(t, got, "Generated cgo sources")
 	assertContains(t, got, "ELF binaries")
