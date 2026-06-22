@@ -1517,13 +1517,13 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "Compressed size    0B")
 	assertContains(t, got, "Savings            0B (0.0%)")
 	assertContains(t, got, "Storage:\n")
-	assertContains(t, got, "Blobs           0      0B")
-	assertContains(t, got, "Retained files  0      0B")
+	assertContains(t, got, "Blobs               0    0B")
+	assertContains(t, got, "Retained files      0    0B")
 	assertContains(t, got, "Blob types (best effort):\n")
-	assertContains(t, got, "None  0      0B            0B")
+	assertContains(t, got, "None      0            0B          0B")
 	assertContains(t, got, "Live runs:\n")
-	assertContains(t, got, "Active    0")
-	assertContains(t, got, "Inactive  0")
+	assertContains(t, got, "Active        0")
+	assertContains(t, got, "Inactive      0")
 }
 
 func TestRunStatusShowsEffectiveConfig(t *testing.T) {
@@ -1576,11 +1576,11 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "Compressed size")
 	assertContains(t, got, "Savings")
 	assertContains(t, got, "Runs               0")
-	assertContains(t, got, "Blobs           1")
+	assertContains(t, got, "Blobs               1")
 	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Text files  1      4B")
-	assertContains(t, got, "Active    0")
-	assertContains(t, got, "Inactive  0")
+	assertContains(t, got, "Text files      1            4B")
+	assertContains(t, got, "Active        0")
+	assertContains(t, got, "Inactive      0")
 }
 
 func TestRunStatusActiveCache(t *testing.T) {
@@ -1616,11 +1616,11 @@ func TestRunStatusActiveCache(t *testing.T) {
 	assertContains(t, got, "Entries            1")
 	assertContains(t, got, "Outputs            1")
 	assertContains(t, got, "Runs               1")
-	assertContains(t, got, "Blobs           1")
+	assertContains(t, got, "Blobs               1")
 	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Text files  1      4B")
-	assertContains(t, got, "Active    1")
-	assertContains(t, got, "Inactive  0")
+	assertContains(t, got, "Text files      1            4B")
+	assertContains(t, got, "Active        1")
+	assertContains(t, got, "Inactive      0")
 }
 
 func TestRunStatusShowsBlobTypes(t *testing.T) {
@@ -1668,9 +1668,9 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 	}
 	got := stdout.String()
 	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Go package archives    1")
+	assertContains(t, got, "Go package archives        1")
 	assertContains(t, got, "export data: ")
-	assertContains(t, got, "Go package indexes     1")
+	assertContains(t, got, "Go package indexes         1")
 	assertContains(t, got, "Generated cgo sources")
 	assertContains(t, got, "ELF binaries")
 	assertContains(t, got, "C compiler IDs")
@@ -1715,7 +1715,7 @@ func TestRunStatusShowsRetainedFileTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Retained files  3")
+	assertContains(t, got, "Retained files      3")
 	assertContains(t, got, "Retained file types:")
 	assertContains(t, got, "Export archives")
 	assertContains(t, got, "Generated cgo sources")
@@ -1755,7 +1755,7 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 	}
 	got := stdout.String()
 	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Unreadable blobs  1      4B")
+	assertContains(t, got, "Unreadable blobs      1            4B")
 }
 
 func TestRunReportsInitialWriteError(t *testing.T) {

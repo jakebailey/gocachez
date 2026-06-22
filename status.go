@@ -83,7 +83,7 @@ func writeStatus(cfg config, w io.Writer) error {
 	}); err != nil {
 		return err
 	}
-	if err := writeTable(w, "Storage", [][]string{
+	if err := writeRightAlignedTable(w, "Storage", [][]string{
 		{"Kind", "Files", "Size"},
 		{"Blobs", formatInt(status.blobFiles), formatBytes(status.blobSize)},
 		{"Retained files", formatInt(status.retainedFiles), formatBytes(status.retainedSize)},
@@ -96,7 +96,7 @@ func writeStatus(cfg config, w io.Writer) error {
 	if err := writeRetainedTypeStatus(w, status.retainedTypes); err != nil {
 		return err
 	}
-	return writeTable(w, "Live runs", [][]string{
+	return writeRightAlignedTable(w, "Live runs", [][]string{
 		{"State", "Count"},
 		{"Active", formatInt(status.activeLiveRuns)},
 		{"Inactive", formatInt(status.inactiveLiveRuns)},
@@ -192,7 +192,7 @@ func readBlobStatus(blobsDir string) (int64, int64, error) {
 
 func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 	if len(statuses) == 0 {
-		return writeTable(w, "Blob types (best effort)", [][]string{
+		return writeRightAlignedTable(w, "Blob types (best effort)", [][]string{
 			{"Type", "Files", "Uncompressed", "Compressed", "Extra"},
 			{"None", "0", formatBytes(0), formatBytes(0), ""},
 		})
@@ -213,12 +213,12 @@ func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 			extra,
 		})
 	}
-	return writeTable(w, "Blob types (best effort)", rows)
+	return writeRightAlignedTable(w, "Blob types (best effort)", rows)
 }
 
 func writeRetainedTypeStatus(w io.Writer, statuses []retainedTypeStatus) error {
 	if len(statuses) == 0 {
-		return writeTable(w, "Retained file types", [][]string{
+		return writeRightAlignedTable(w, "Retained file types", [][]string{
 			{"Type", "Files", "Size"},
 			{"None", "0", formatBytes(0)},
 		})
@@ -233,10 +233,18 @@ func writeRetainedTypeStatus(w io.Writer, statuses []retainedTypeStatus) error {
 			formatBytes(status.size),
 		})
 	}
-	return writeTable(w, "Retained file types", rows)
+	return writeRightAlignedTable(w, "Retained file types", rows)
 }
 
 func writeTable(w io.Writer, title string, rows [][]string) error {
+	return writeTableAligned(w, title, rows, false)
+}
+
+func writeRightAlignedTable(w io.Writer, title string, rows [][]string) error {
+	return writeTableAligned(w, title, rows, true)
+}
+
+func writeTableAligned(w io.Writer, title string, rows [][]string, rightAlignColumns bool) error {
 	if _, err := fmt.Fprintf(w, "%s:\n", title); err != nil {
 		return fmt.Errorf("write status: %w", err)
 	}
@@ -255,11 +263,17 @@ func writeTable(w io.Writer, title string, rows [][]string) error {
 					return fmt.Errorf("write status: %w", err)
 				}
 			}
+			padding := widths[i] - len(cell)
+			if rightAlignColumns && i > 0 {
+				if _, err := fmt.Fprint(w, strings.Repeat(" ", padding)); err != nil {
+					return fmt.Errorf("write status: %w", err)
+				}
+			}
 			if _, err := fmt.Fprint(w, cell); err != nil {
 				return fmt.Errorf("write status: %w", err)
 			}
-			if i < last {
-				if _, err := fmt.Fprint(w, strings.Repeat(" ", widths[i]-len(cell))); err != nil {
+			if i < last && (!rightAlignColumns || i == 0) {
+				if _, err := fmt.Fprint(w, strings.Repeat(" ", padding)); err != nil {
 					return fmt.Errorf("write status: %w", err)
 				}
 			}
