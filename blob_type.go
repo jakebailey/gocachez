@@ -32,6 +32,11 @@ const (
 	blobTypeWasmBinary
 	blobTypeCCompilerID
 	blobTypeGoTestOutput
+	blobTypeGoTestInputLog
+	blobTypeGoCoverageProfile
+	blobTypeGoToolOutput
+	blobTypeGoSourceFileList
+	blobTypeGoToolFlagProbe
 	blobTypeText
 	blobTypeEmpty
 	blobTypeUnknownBinary
@@ -210,6 +215,21 @@ func classifyBlobData(data []byte) blobClassification {
 	if isGoTestOutput(data) {
 		return blobClassification{kind: blobTypeGoTestOutput}
 	}
+	if isGoTestInputLog(data) {
+		return blobClassification{kind: blobTypeGoTestInputLog}
+	}
+	if isGoCoverageProfile(data) {
+		return blobClassification{kind: blobTypeGoCoverageProfile}
+	}
+	if isGoToolOutput(data) {
+		return blobClassification{kind: blobTypeGoToolOutput}
+	}
+	if isGoSourceFileList(data) {
+		return blobClassification{kind: blobTypeGoSourceFileList}
+	}
+	if isGoToolFlagProbe(data) {
+		return blobClassification{kind: blobTypeGoToolFlagProbe}
+	}
 	if isLikelyText(data) {
 		if looksLikeGoSource(data) {
 			return blobClassification{kind: blobTypeGoSource}
@@ -306,6 +326,12 @@ func isGoTestOutput(data []byte) bool {
 		[]byte("\x16--- SKIP"),
 		[]byte("\x16PASS\n"),
 		[]byte("\x16FAIL\n"),
+		[]byte("ok  \t"),
+		[]byte("?   \t"),
+		[]byte("FAIL\t"),
+		[]byte("PASS\nok  \t"),
+		[]byte("PASS\n?   \t"),
+		[]byte("FAIL\nFAIL\t"),
 	}
 	for _, marker := range markers {
 		if bytes.HasPrefix(data, marker) || bytes.Contains(data, append([]byte("\n"), marker...)) {
@@ -313,6 +339,78 @@ func isGoTestOutput(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func isGoTestInputLog(data []byte) bool {
+	return bytes.HasPrefix(data, []byte("# test log\n"))
+}
+
+func isGoCoverageProfile(data []byte) bool {
+	line, _, ok := bytes.Cut(data, []byte("\n"))
+	if !ok {
+		return false
+	}
+	return bytes.Equal(line, []byte("mode: set")) ||
+		bytes.Equal(line, []byte("mode: count")) ||
+		bytes.Equal(line, []byte("mode: atomic"))
+}
+
+func isGoToolOutput(data []byte) bool {
+	line, _, ok := bytes.Cut(data, []byte("\n"))
+	if !ok || !bytes.HasPrefix(line, []byte("# ")) || bytes.Equal(line, []byte("# test log")) {
+		return false
+	}
+	name := line[len("# "):]
+	return len(name) > 0 && !bytes.ContainsAny(name, " \t")
+}
+
+func isGoSourceFileList(data []byte) bool {
+	if !isLikelyText(data) {
+		return false
+	}
+	lines := bytes.Split(data, []byte("\n"))
+	switch {
+	case len(lines[len(lines)-1]) == 0:
+		lines = lines[:len(lines)-1]
+	case len(data) == blobTypePrefixLimit:
+		lines = lines[:len(lines)-1]
+	default:
+		return false
+	}
+	for _, line := range lines {
+		if !isGoSourceFileListPath(line) {
+			return false
+		}
+	}
+	return len(lines) > 0
+}
+
+func isGoSourceFileListPath(path []byte) bool {
+	if len(path) == 0 ||
+		bytes.HasPrefix(path, []byte("/")) ||
+		bytes.HasPrefix(path, []byte("../")) ||
+		bytes.ContainsAny(path, " \t\r") {
+		return false
+	}
+	return bytes.HasPrefix(path, []byte("./")) || hasGoSourceFileListExtension(path)
+}
+
+func hasGoSourceFileListExtension(path []byte) bool {
+	extensions := [][]byte{
+		[]byte(".go"),
+		[]byte(".s"),
+		[]byte(".c"),
+	}
+	for _, ext := range extensions {
+		if bytes.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGoToolFlagProbe(data []byte) bool {
+	return bytes.Equal(data, []byte("true")) || bytes.Equal(data, []byte("false"))
 }
 
 func (kind blobTypeKind) label() string {
@@ -341,6 +439,16 @@ func (kind blobTypeKind) label() string {
 		return "C compiler IDs"
 	case blobTypeGoTestOutput:
 		return "Go test outputs"
+	case blobTypeGoTestInputLog:
+		return "Go test input logs"
+	case blobTypeGoCoverageProfile:
+		return "Go coverage profiles"
+	case blobTypeGoToolOutput:
+		return "Go tool outputs"
+	case blobTypeGoSourceFileList:
+		return "Go source file lists"
+	case blobTypeGoToolFlagProbe:
+		return "Go tool flag probes"
 	case blobTypeText:
 		return "Text files"
 	case blobTypeEmpty:
