@@ -288,7 +288,7 @@ func tableWidths(rows [][]string) []int {
 }
 
 func formatBytes(size int64) string {
-	return fmt.Sprintf("%s (%d bytes)", formatSize(size), size)
+	return formatSize(size)
 }
 
 func formatInt(n int64) string {
