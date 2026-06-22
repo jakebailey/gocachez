@@ -16,10 +16,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/klauspost/compress/zstd"
 )
 
 var errInvalidCacheEntry = errors.New("invalid cache entry")
+
+const (
+	retainedMTimeInterval = time.Hour
+	retainedTrimLimit     = 5 * 24 * time.Hour
+)
 
 var decoderOptions = []zstd.DOption{
 	zstd.WithDecoderConcurrency(1),
@@ -364,6 +370,12 @@ func (st *store) pruneLocked() error {
 	if activeRuns > 0 {
 		return nil
 	}
+	if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
+		return err
+	}
+	if err := st.pruneOldRetainedLiveDirs(time.Now()); err != nil {
+		return err
+	}
 	if err := st.removeOrphanRetainedFiles(); err != nil {
 		return err
 	}
@@ -453,6 +465,135 @@ func (st *store) removeOrphanRetainedFiles() error {
 	return st.removeOrphanOutputFiles(retainedRoot(st.versionDir), func(path string) bool {
 		return strings.HasSuffix(path, ".a") || strings.HasSuffix(path, ".go")
 	})
+}
+
+func (st *store) pruneOldRetainedFiles(now time.Time) error {
+	root := retainedRoot(st.versionDir)
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat retained root: %w", err)
+	}
+	cutoff := retainedPruneCutoff(now)
+	removed := 0
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || (!strings.HasSuffix(path, ".a") && !strings.HasSuffix(path, ".go")) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("stat retained file: %w", err)
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove old retained file: %w", err)
+			}
+			removed++
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if st.verbose && removed > 0 {
+		log.Printf("gocachez: pruned %d old retained files", removed)
+	}
+	return removeEmptyDirs(root)
+}
+
+func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
+	entries, err := os.ReadDir(st.liveRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read live dir: %w", err)
+	}
+	cutoff := retainedPruneCutoff(now)
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		runDir := filepath.Join(st.liveRoot, entry.Name())
+		runLock := flock.New(filepath.Join(runDir, "run.lock"))
+		locked, err := runLock.TryLock()
+		if err != nil {
+			_ = runLock.Close()
+			return fmt.Errorf("try lock retained live run %s: %w", entry.Name(), err)
+		}
+		if !locked {
+			_ = runLock.Close()
+			continue
+		}
+		expired, expireErr := retainedLiveRunExpired(runDir, cutoff)
+		unlockErr := runLock.Unlock()
+		closeErr := runLock.Close()
+		if expireErr != nil {
+			return expireErr
+		}
+		if unlockErr != nil {
+			return fmt.Errorf("unlock retained live run: %w", unlockErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close retained live run lock: %w", closeErr)
+		}
+		if expired {
+			if err := os.RemoveAll(runDir); err != nil {
+				return fmt.Errorf("remove old retained live run: %w", err)
+			}
+			removed++
+		}
+	}
+	if st.verbose && removed > 0 {
+		log.Printf("gocachez: pruned %d old retained live runs", removed)
+	}
+	return nil
+}
+
+func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
+	entries, err := os.ReadDir(runDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read retained live run: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "run.lock" {
+			continue
+		}
+		if entry.IsDir() {
+			return false, nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return false, fmt.Errorf("stat retained live file: %w", err)
+		}
+		if !info.Mode().IsRegular() || !info.ModTime().Before(cutoff) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func retainedPruneCutoff(now time.Time) time.Time {
+	return now.Add(-retainedTrimLimit - retainedMTimeInterval)
+}
+
+func markRetainedFileUsed(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if now.Sub(info.ModTime()) < retainedMTimeInterval {
+		return nil
+	}
+	return os.Chtimes(path, now, now)
 }
 
 func (st *store) removeOrphanOutputFiles(root string, include func(string) bool) error {

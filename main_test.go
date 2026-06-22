@@ -789,6 +789,105 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	}
 }
 
+func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exportData := []byte("uFAKE")
+	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
+	actionID := bytes.Repeat([]byte{63}, 32)
+	outputID := bytes.Repeat([]byte{64}, 32)
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	exportPath := retainedPath(cacheDir, outputID, ".a")
+	old := retainedPruneCutoff(time.Now()).Add(-time.Minute)
+	for _, path := range []string{exportPath, res.DiskPath} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	st, err = newStore(config{
+		dir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(exportPath); !os.IsNotExist(err) {
+		t.Fatalf("old retained export stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("old retained live file stat err = %v, want not exist", err)
+	}
+}
+
+func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	exportData := []byte("uFAKE")
+	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
+	outputID := bytes.Repeat([]byte{66}, 32)
+	for i := range 2 {
+		st, err := newStore(config{
+			dir: cacheDir,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.put(request{
+			ID:       1,
+			Command:  cmdPut,
+			ActionID: bytes.Repeat([]byte{byte(67 + i)}, 32),
+			OutputID: outputID,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+		st.close()
+		if i == 0 {
+			exportPath := retainedPath(cacheDir, outputID, ".a")
+			old := retainedPruneCutoff(time.Now()).Add(-time.Minute)
+			if err := os.Chtimes(exportPath, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	exportPath := retainedPath(cacheDir, outputID, ".a")
+	info, err := os.Stat(exportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().After(retainedPruneCutoff(time.Now())) {
+		t.Fatalf("retained export mtime = %v, want refreshed after cutoff", info.ModTime())
+	}
+}
+
 func TestCloseRetainsGeneratedCgoSourceLiveFile(t *testing.T) {
 	t.Parallel()
 

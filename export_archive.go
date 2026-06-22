@@ -96,14 +96,14 @@ func stripPackageArchiveToExport(path, exportPath string) (bool, error) {
 
 func installExportArchive(tmpPath, exportPath string) error {
 	if regularFile(exportPath) {
-		return nil
+		return markRetainedFileUsed(exportPath)
 	}
 	err := os.Rename(tmpPath, exportPath)
 	if err == nil {
 		return nil
 	}
 	if regularFile(exportPath) {
-		return nil
+		return markRetainedFileUsed(exportPath)
 	}
 	return fmt.Errorf("install export archive: %w", err)
 }
@@ -238,7 +238,7 @@ func archiveMemberHeader(header []byte) (string, int64, bool) {
 
 func installRetainedFile(data []byte, retainedPath string) error {
 	if regularFile(retainedPath) {
-		return nil
+		return markRetainedFileUsed(retainedPath)
 	}
 	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o777); err != nil {
 		return fmt.Errorf("create retained dir: %w", err)
@@ -263,7 +263,7 @@ func installRetainedFile(data []byte, retainedPath string) error {
 		return nil
 	}
 	if regularFile(retainedPath) {
-		return nil
+		return markRetainedFileUsed(retainedPath)
 	}
 	return fmt.Errorf("install retained file: %w", err)
 }
