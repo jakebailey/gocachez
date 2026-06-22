@@ -31,6 +31,7 @@ const (
 	blobTypePEBinary
 	blobTypeWasmBinary
 	blobTypeCCompilerID
+	blobTypeGoTestOutput
 	blobTypeText
 	blobTypeEmpty
 	blobTypeUnknownBinary
@@ -206,6 +207,9 @@ func classifyBlobData(data []byte) blobClassification {
 	if isCCompilerID(data) {
 		return blobClassification{kind: blobTypeCCompilerID}
 	}
+	if isGoTestOutput(data) {
+		return blobClassification{kind: blobTypeGoTestOutput}
+	}
 	if isLikelyText(data) {
 		if looksLikeGoSource(data) {
 			return blobClassification{kind: blobTypeGoSource}
@@ -291,6 +295,26 @@ func isLikelyText(data []byte) bool {
 	return true
 }
 
+func isGoTestOutput(data []byte) bool {
+	markers := [][]byte{
+		[]byte("\x16=== RUN"),
+		[]byte("\x16=== PAUSE"),
+		[]byte("\x16=== NAME"),
+		[]byte("\x16=== CONT"),
+		[]byte("\x16--- PASS"),
+		[]byte("\x16--- FAIL"),
+		[]byte("\x16--- SKIP"),
+		[]byte("\x16PASS\n"),
+		[]byte("\x16FAIL\n"),
+	}
+	for _, marker := range markers {
+		if bytes.HasPrefix(data, marker) || bytes.Contains(data, append([]byte("\n"), marker...)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (kind blobTypeKind) label() string {
 	switch kind {
 	case blobTypeGoPackageArchive:
@@ -315,6 +339,8 @@ func (kind blobTypeKind) label() string {
 		return "WebAssembly binaries"
 	case blobTypeCCompilerID:
 		return "C compiler IDs"
+	case blobTypeGoTestOutput:
+		return "Go test outputs"
 	case blobTypeText:
 		return "Text files"
 	case blobTypeEmpty:

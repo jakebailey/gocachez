@@ -48,6 +48,20 @@ func TestClassifyBlobDataRecognizesCCompilerID(t *testing.T) {
 	}
 }
 
+func TestClassifyBlobDataRecognizesGoTestOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range [][]byte{
+		[]byte("\x16=== RUN   TestExample\n\x16--- PASS: TestExample (0.00s)\n\x16PASS\nok  \texample.com/pkg\t0.001s\n"),
+		[]byte("testing: warning: no tests to run\n\x16PASS\nok  \texample.com/pkg\t0.001s\n"),
+	} {
+		classification := classifyBlobData(body)
+		if classification.kind != blobTypeGoTestOutput {
+			t.Fatalf("classification = %v, want %v for %q", classification.kind, blobTypeGoTestOutput, body)
+		}
+	}
+}
+
 func writeCompressedTestBlob(t *testing.T, path string, body []byte) {
 	t.Helper()
 
