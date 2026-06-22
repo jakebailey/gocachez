@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -25,6 +26,7 @@ type cacheStatus struct {
 	blobTypes        []blobTypeStatus
 	retainedFiles    int64
 	retainedSize     int64
+	retainedTypes    []retainedTypeStatus
 	activeLiveRuns   int64
 	inactiveLiveRuns int64
 }
@@ -35,6 +37,21 @@ type catalogStatus struct {
 	size           int64
 	compressedSize int64
 	runs           int64
+}
+
+type retainedTypeKind int
+
+const (
+	retainedTypeExportArchive retainedTypeKind = iota
+	retainedTypeGeneratedCgoSource
+	retainedTypeGeneratedTestmain
+	retainedTypeOther
+)
+
+type retainedTypeStatus struct {
+	kind  retainedTypeKind
+	count int64
+	size  int64
 }
 
 func writeStatus(cfg config, w io.Writer) error {
@@ -74,6 +91,9 @@ func writeStatus(cfg config, w io.Writer) error {
 		return err
 	}
 	if err := writeBlobTypeStatus(w, status.blobTypes); err != nil {
+		return err
+	}
+	if err := writeRetainedTypeStatus(w, status.retainedTypes); err != nil {
 		return err
 	}
 	return writeTable(w, "Live runs", [][]string{
@@ -118,7 +138,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 		if err != nil {
 			return err
 		}
-		status.retainedFiles, status.retainedSize, err = readRetainedStatus(retainedRoot(versionDir))
+		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(retainedRoot(versionDir))
 		if err != nil {
 			return err
 		}
@@ -196,6 +216,26 @@ func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 	return writeTable(w, "Blob types (best effort)", rows)
 }
 
+func writeRetainedTypeStatus(w io.Writer, statuses []retainedTypeStatus) error {
+	if len(statuses) == 0 {
+		return writeTable(w, "Retained file types", [][]string{
+			{"Type", "Files", "Size"},
+			{"None", "0", formatBytes(0)},
+		})
+	}
+	rows := [][]string{
+		{"Type", "Files", "Size"},
+	}
+	for _, status := range statuses {
+		rows = append(rows, []string{
+			status.kind.label(),
+			formatInt(status.count),
+			formatBytes(status.size),
+		})
+	}
+	return writeTable(w, "Retained file types", rows)
+}
+
 func writeTable(w io.Writer, title string, rows [][]string) error {
 	if _, err := fmt.Fprintf(w, "%s:\n", title); err != nil {
 		return fmt.Errorf("write status: %w", err)
@@ -255,8 +295,71 @@ func formatInt(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-func readRetainedStatus(root string) (int64, int64, error) {
-	return readSuffixedFileStatus(root, "")
+func readRetainedStatus(root string) (int64, int64, []retainedTypeStatus, error) {
+	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
+	var files, size int64
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("stat retained file: %w", err)
+		}
+		kind := retainedFileKind(path)
+		status := byKind[kind]
+		if status == nil {
+			status = &retainedTypeStatus{
+				kind: kind,
+			}
+			byKind[kind] = status
+		}
+		status.count++
+		status.size += info.Size()
+		files++
+		size += info.Size()
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil, nil
+	}
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	statuses := make([]retainedTypeStatus, 0, len(byKind))
+	for _, status := range byKind {
+		statuses = append(statuses, *status)
+	}
+	sort.Slice(statuses, func(i, j int) bool {
+		if statuses[i].size != statuses[j].size {
+			return statuses[i].size > statuses[j].size
+		}
+		return statuses[i].kind.label() < statuses[j].kind.label()
+	})
+	return files, size, statuses, nil
+}
+
+func retainedFileKind(path string) retainedTypeKind {
+	switch filepath.Ext(path) {
+	case ".a":
+		return retainedTypeExportArchive
+	case ".go":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return retainedTypeOther
+		}
+		if isGeneratedCgoSource(data) {
+			return retainedTypeGeneratedCgoSource
+		}
+		if isGeneratedTestmainSource(data) {
+			return retainedTypeGeneratedTestmain
+		}
+	}
+	return retainedTypeOther
 }
 
 func readSuffixedFileStatus(root, suffix string) (int64, int64, error) {
@@ -320,4 +423,17 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 		inactive++
 	}
 	return active, inactive, nil
+}
+
+func (kind retainedTypeKind) label() string {
+	switch kind {
+	case retainedTypeExportArchive:
+		return "Export archives"
+	case retainedTypeGeneratedCgoSource:
+		return "Generated cgo sources"
+	case retainedTypeGeneratedTestmain:
+		return "Generated test mains"
+	default:
+		return "Other retained files"
+	}
 }
