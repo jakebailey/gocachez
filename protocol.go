@@ -335,7 +335,7 @@ func (r *jsonStringReader) Read(p []byte) (int, error) {
 	}
 	n := copy(p, chunk)
 	if n < len(chunk) {
-		r.pending = append(r.pending, chunk[n:]...)
+		r.pending = chunk[n:]
 	}
 	if n == 0 && r.done {
 		return 0, io.EOF
