@@ -1608,21 +1608,23 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "20.0GiB")
 	assertContains(t, got, "Verbose")
 	assertContains(t, got, "false")
-	assertContains(t, got, "Catalog:\n")
-	assertContains(t, got, "State              missing")
-	assertContains(t, got, "Entries            0")
-	assertContains(t, got, "Outputs            0")
-	assertContains(t, got, "Uncompressed size  0B")
-	assertContains(t, got, "Compressed size    0B")
-	assertContains(t, got, "Savings            0B (0.0%)")
+	assertContains(t, got, "Summary:\n")
+	assertContains(t, got, "State               missing")
+	assertContains(t, got, "Cached actions      0")
+	assertContains(t, got, "Cached outputs      0")
+	assertContains(t, got, "Oldest cache entry  n/a")
+	assertContains(t, got, "Live runs           0 active, 0 inactive")
 	assertContains(t, got, "Storage:\n")
-	assertContains(t, got, "Blobs               0    0B")
-	assertContains(t, got, "Retained files      0    0B")
-	assertContains(t, got, "Blob types (best effort):\n")
-	assertContains(t, got, "None      0            0B          0B")
-	assertContains(t, got, "Live runs:\n")
-	assertContains(t, got, "Active        0")
-	assertContains(t, got, "Inactive      0")
+	assertContains(t, got, "Original output size    0B")
+	assertContains(t, got, "Compressed cache blobs  0B (0 files)")
+	assertContains(t, got, "Blob max usage          0B / 20.0GiB (0.0%, 20.0GiB remaining)")
+	assertContains(t, got, "Retained go-list files  0B (0 files)")
+	assertContains(t, got, "Total stored            0B")
+	assertContains(t, got, "Blob-only savings       0B (0.0%)")
+	assertContains(t, got, "Overall savings         0B (0.0%)")
+	assertContains(t, got, "Compressed blob contents:\n")
+	assertContains(t, got, "None      0        0B      0B  0B (0.0%)")
+	assertContains(t, got, "Retained go-list files:\n")
 }
 
 func TestRunStatusShowsEffectiveConfig(t *testing.T) {
@@ -1668,18 +1670,20 @@ func TestRunStatusInactiveCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "State              present")
-	assertContains(t, got, "Entries            1")
-	assertContains(t, got, "Outputs            1")
-	assertContains(t, got, "Uncompressed size  4B")
-	assertContains(t, got, "Compressed size")
-	assertContains(t, got, "Savings")
-	assertContains(t, got, "Runs               0")
-	assertContains(t, got, "Blobs               1")
-	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Text files      1            4B")
-	assertContains(t, got, "Active        0")
-	assertContains(t, got, "Inactive      0")
+	assertContains(t, got, "State               present")
+	assertContains(t, got, "Cached actions      1")
+	assertContains(t, got, "Cached outputs      1")
+	assertContains(t, got, "Oldest cache entry  <1m")
+	assertContains(t, got, "Live runs           0 active, 0 inactive")
+	assertContains(t, got, "Original output size")
+	assertContains(t, got, "Compressed cache blobs")
+	assertContains(t, got, "Blob max usage")
+	assertContains(t, got, "Retained go-list files")
+	assertContains(t, got, "Total stored")
+	assertContains(t, got, "Blob-only savings")
+	assertContains(t, got, "Overall savings")
+	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Text files      1        4B")
 }
 
 func TestRunStatusActiveCache(t *testing.T) {
@@ -1711,15 +1715,12 @@ func TestRunStatusActiveCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "State              present")
-	assertContains(t, got, "Entries            1")
-	assertContains(t, got, "Outputs            1")
-	assertContains(t, got, "Runs               1")
-	assertContains(t, got, "Blobs               1")
-	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Text files      1            4B")
-	assertContains(t, got, "Active        1")
-	assertContains(t, got, "Inactive      0")
+	assertContains(t, got, "State               present")
+	assertContains(t, got, "Cached actions      1")
+	assertContains(t, got, "Cached outputs      1")
+	assertContains(t, got, "Live runs           1 active, 0 inactive")
+	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Text files      1        4B")
 }
 
 func TestRunStatusShowsBlobTypes(t *testing.T) {
@@ -1766,7 +1767,7 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Blob types (best effort):")
+	assertContains(t, got, "Compressed blob contents:")
 	assertContains(t, got, "Go package archives        1")
 	assertContains(t, got, "Go package indexes         1")
 	assertContains(t, got, "Generated cgo sources")
@@ -1813,8 +1814,7 @@ func TestRunStatusShowsRetainedFileTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Retained files      3")
-	assertContains(t, got, "Retained file types:")
+	assertContains(t, got, "Retained go-list files")
 	assertContains(t, got, "Export archives")
 	assertContains(t, got, "Generated cgo sources")
 	assertContains(t, got, "Generated test mains")
@@ -1852,8 +1852,8 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Blob types (best effort):")
-	assertContains(t, got, "Unreadable blobs      1            4B")
+	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Unreadable blobs      1        4B")
 }
 
 func TestRunReportsInitialWriteError(t *testing.T) {
@@ -2378,6 +2378,97 @@ func TestFormatSavings(t *testing.T) {
 
 			if got := formatSavings(tc.uncompressed, tc.compressed); got != tc.want {
 				t.Fatalf("formatSavings(%d, %d) = %q, want %q", tc.uncompressed, tc.compressed, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatSavingsParts(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		uncompressed int64
+		compressed   int64
+		wantAmount   string
+		wantPercent  string
+	}{
+		"empty": {
+			uncompressed: 0,
+			compressed:   13,
+			wantAmount:   "0B",
+			wantPercent:  "0.0%",
+		},
+		"saved": {
+			uncompressed: 100,
+			compressed:   25,
+			wantAmount:   "75B",
+			wantPercent:  "75.0%",
+		},
+		"grew": {
+			uncompressed: 100,
+			compressed:   125,
+			wantAmount:   "-25B",
+			wantPercent:  "-25.0%",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := formatSavingsAmount(tc.uncompressed, tc.compressed); got != tc.wantAmount {
+				t.Fatalf("formatSavingsAmount(%d, %d) = %q, want %q", tc.uncompressed, tc.compressed, got, tc.wantAmount)
+			}
+			if got := formatSavingsPercent(tc.uncompressed, tc.compressed); got != tc.wantPercent {
+				t.Fatalf("formatSavingsPercent(%d, %d) = %q, want %q", tc.uncompressed, tc.compressed, got, tc.wantPercent)
+			}
+		})
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		age  time.Duration
+		want string
+	}{
+		"negative": {-time.Second, "<1m"},
+		"seconds":  {30 * time.Second, "<1m"},
+		"minutes":  {42 * time.Minute, "42m"},
+		"hours":    {3*time.Hour + 12*time.Minute, "3h 12m"},
+		"days":     {5*24*time.Hour + 4*time.Hour, "5d 4h"},
+		"years":    {2*365*24*time.Hour + 3*24*time.Hour, "2y 3d"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := formatAge(tc.age); got != tc.want {
+				t.Fatalf("formatAge(%v) = %q, want %q", tc.age, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatMaxUsage(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		size    int64
+		maxSize int64
+		want    string
+	}{
+		"disabled": {size: 10, maxSize: 0, want: "disabled"},
+		"empty":    {size: 0, maxSize: 20 << 30, want: "0B / 20.0GiB (0.0%, 20.0GiB remaining)"},
+		"half":     {size: 10 << 30, maxSize: 20 << 30, want: "10.0GiB / 20.0GiB (50.0%, 10.0GiB remaining)"},
+		"over":     {size: 25 << 30, maxSize: 20 << 30, want: "25.0GiB / 20.0GiB (125.0%, -5.0GiB remaining)"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := formatMaxUsage(tc.size, tc.maxSize); got != tc.want {
+				t.Fatalf("formatMaxUsage(%d, %d) = %q, want %q", tc.size, tc.maxSize, got, tc.want)
 			}
 		})
 	}

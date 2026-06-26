@@ -79,6 +79,9 @@ var sizeUnits = map[string]int64{
 }
 
 func formatSize(size int64) string {
+	if size < 0 {
+		return "-" + formatSize(-size)
+	}
 	const unit = 1024
 	if size < unit {
 		return fmt.Sprintf("%dB", size)
@@ -92,12 +95,21 @@ func formatSize(size int64) string {
 }
 
 func formatSavings(uncompressed, compressed int64) string {
+	return fmt.Sprintf("%s (%s)", formatSavingsAmount(uncompressed, compressed), formatSavingsPercent(uncompressed, compressed))
+}
+
+func formatSavingsAmount(uncompressed, compressed int64) string {
 	if uncompressed <= 0 {
-		return "0B (0.0%)"
+		return "0B"
 	}
-	saved := uncompressed - compressed
-	percent := float64(saved) / float64(uncompressed) * 100
-	return fmt.Sprintf("%s (%.1f%%)", formatSize(saved), percent)
+	return formatSize(uncompressed - compressed)
+}
+
+func formatSavingsPercent(uncompressed, compressed int64) string {
+	if uncompressed <= 0 {
+		return "0.0%"
+	}
+	return fmt.Sprintf("%.1f%%", float64(uncompressed-compressed)/float64(uncompressed)*100)
 }
 
 func unixMillis(t time.Time) int64 {
