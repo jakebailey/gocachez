@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/gofrs/flock v0.13.0
 	github.com/klauspost/compress v1.19.0
+	golang.org/x/term v0.44.0
 	golang.org/x/tools v0.47.0
 	modernc.org/sqlite v1.53.0
 )

@@ -2193,6 +2193,39 @@ func TestRunReportsInitialWriteError(t *testing.T) {
 	}
 }
 
+func TestStdoutIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	// The go command connects the helper's stdout to a pipe and tests use
+	// in-memory writers; none of these must be detected as a terminal, so the
+	// protocol handshake is still emitted rather than usage.
+	if stdoutIsTerminal(&bytes.Buffer{}) {
+		t.Fatal("bytes.Buffer reported as terminal")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close() //nolint:errcheck
+	defer w.Close() //nolint:errcheck
+	if stdoutIsTerminal(w) {
+		t.Fatal("os.Pipe reported as terminal")
+	}
+}
+
+func TestRunProtocolIgnoresTerminalCheckForPipes(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	stdin := strings.NewReader(`{"ID":1,"Command":"close"}` + "\n")
+	if err := run([]string{"-dir", t.TempDir()}, stdin, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), `"KnownCommands"`) {
+		t.Fatalf("protocol handshake missing; got %q", stdout.String())
+	}
+}
+
 func TestRunWritesProfiles(t *testing.T) {
 	dir := t.TempDir()
 	cpuProfile := filepath.Join(dir, "cpu.pprof")

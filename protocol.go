@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type command string
@@ -76,6 +78,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 	if mode == runModeStatus {
 		return writeStatus(cfg, stdout)
 	}
+	if stdoutIsTerminal(stdout) {
+		// A human ran gocachez directly: the go command always connects the
+		// helper's stdout to a pipe, so a terminal here means no protocol
+		// client is listening. Show usage instead of emitting the handshake
+		// and blocking on stdin.
+		return writeHelp(stdout, runModeProtocol)
+	}
 
 	st, err := newStore(cfg)
 	if err != nil {
@@ -132,6 +141,11 @@ func parseRunArgs(args []string) (config, runMode, error) {
 
 	cfg, err := parseFlags(args)
 	return cfg, runModeProtocol, err
+}
+
+func stdoutIsTerminal(stdout io.Writer) bool {
+	f, ok := stdout.(*os.File)
+	return ok && term.IsTerminal(int(f.Fd()))
 }
 
 func isRunMode(arg string) bool {
