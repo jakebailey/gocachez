@@ -24,7 +24,6 @@ type cacheStatus struct {
 	catalogExists    bool
 	catalog          catalogStatus
 	blobFiles        int64
-	blobSize         int64
 	blobTypes        []blobTypeStatus
 	retainedFiles    int64
 	retainedSize     int64
@@ -128,18 +127,16 @@ func readStatus(cfg config) (cacheStatus, error) {
 	}
 	err := st.withLifecycleLock(func() error {
 		var err error
-		status.catalogExists, status.catalog, err = readCatalogStatus(filepath.Join(versionDir, "cache.db"))
+		dbPath := filepath.Join(versionDir, "cache.db")
+		var outputs []catalogOutput
+		status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath)
 		if err != nil {
 			return err
 		}
-		status.blobFiles, status.blobSize, err = readBlobStatus(blobsDir)
-		if err != nil {
-			return err
-		}
-		status.blobTypes, err = readBlobTypeStatus(filepath.Join(versionDir, "cache.db"), blobsDir)
-		if err != nil {
-			return err
-		}
+		// Blob file count matches the number of cached outputs, so derive it
+		// from the catalog instead of walking the blobs directory.
+		status.blobFiles = status.catalog.outputs
+		status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
 		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(retainedRoot(versionDir))
 		if err != nil {
 			return err
@@ -153,51 +150,55 @@ func readStatus(cfg config) (cacheStatus, error) {
 	return status, nil
 }
 
-func readCatalogStatus(dbPath string) (bool, catalogStatus, error) {
+// readCatalogStatus opens the catalog once and returns the aggregate status
+// plus the per-output rows. It performs a single GROUP BY output_id scan
+// (listOutputs) to derive the output count, sizes, and cached blob types, so
+// callers can reuse outputs for the blob-type breakdown without rescanning.
+func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, error) {
 	if !regularFile(dbPath) {
-		return false, catalogStatus{}, nil
+		return false, catalogStatus{}, nil, nil
 	}
 
 	db, err := openExistingDB(dbPath)
 	if err != nil {
-		return false, catalogStatus{}, err
+		return false, catalogStatus{}, nil, err
 	}
 	defer db.Close() //nolint:errcheck
 
 	ctx := context.Background()
 	var status catalogStatus
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&status.entries); err != nil {
-		return false, catalogStatus{}, fmt.Errorf("count catalog entries: %w", err)
-	}
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT output_id) FROM entries`).Scan(&status.outputs); err != nil {
-		return false, catalogStatus{}, fmt.Errorf("count catalog outputs: %w", err)
+		return false, catalogStatus{}, nil, fmt.Errorf("count catalog entries: %w", err)
 	}
 	var oldestAccessedAt sql.NullInt64
 	if err := db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM entries`).Scan(&oldestAccessedAt); err != nil {
-		return false, catalogStatus{}, fmt.Errorf("find oldest catalog access: %w", err)
+		return false, catalogStatus{}, nil, fmt.Errorf("find oldest catalog access: %w", err)
 	}
 	if oldestAccessedAt.Valid {
 		status.oldestAccessedAt = millisTime(oldestAccessedAt.Int64)
 		status.hasOldestAccessed = true
 	}
-	status.size, err = catalogSize(ctx, db)
-	if err != nil {
-		return false, catalogStatus{}, err
-	}
+
 	q := newCatalog(db)
-	status.compressedSize, err = q.compressedSize(ctx)
+	hasType, err := entriesHasColumn(ctx, db, "blob_type_version")
 	if err != nil {
-		return false, catalogStatus{}, fmt.Errorf("calculate catalog compressed size: %w", err)
+		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
 	}
+	outputs, err := q.listOutputs(ctx, hasType, blobClassifierVersion)
+	if err != nil {
+		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
+	}
+	for _, output := range outputs {
+		status.size += output.size
+		status.compressedSize += output.compressedSize
+	}
+	status.outputs = int64(len(outputs))
+
 	status.runs, err = q.countRuns(ctx)
 	if err != nil {
-		return false, catalogStatus{}, fmt.Errorf("count catalog runs: %w", err)
+		return false, catalogStatus{}, nil, fmt.Errorf("count catalog runs: %w", err)
 	}
-	return true, status, nil
-}
-
-func readBlobStatus(blobsDir string) (int64, int64, error) {
-	return readSuffixedFileStatus(blobsDir, ".zst")
+	return true, status, outputs, nil
 }
 
 func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
@@ -464,32 +465,6 @@ func retainedFileKind(path string) retainedTypeKind {
 		}
 	}
 	return retainedTypeOther
-}
-
-func readSuffixedFileStatus(root, suffix string) (int64, int64, error) {
-	var files, size int64
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || !strings.HasSuffix(path, suffix) {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return fmt.Errorf("stat file: %w", err)
-		}
-		files++
-		size += info.Size()
-		return nil
-	})
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	return files, size, nil
 }
 
 func readLiveStatus(liveRoot string) (int64, int64, error) {

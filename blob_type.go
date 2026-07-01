@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -65,30 +64,17 @@ type blobClassification struct {
 }
 
 func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
-	if !regularFile(dbPath) {
-		return nil, nil
-	}
-
-	db, err := openExistingDB(dbPath)
+	_, _, outputs, err := readCatalogStatus(dbPath)
 	if err != nil {
 		return nil, err
 	}
+	return blobTypeStatuses(dbPath, blobsDir, outputs), nil
+}
 
-	ctx := context.Background()
-	cat := newCatalog(db)
-	// The versioned query below reads blob_type_version; older caches migrate to
-	// both blob-type columns together, so gate on the one the query depends on.
-	hasType, err := entriesHasColumn(ctx, db, "blob_type_version")
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("inspect catalog schema: %w", err)
-	}
-	outputs, err := cat.listOutputs(ctx, hasType, blobClassifierVersion)
-	_ = db.Close()
-	if err != nil {
-		return nil, fmt.Errorf("list catalog outputs: %w", err)
-	}
-
+// blobTypeStatuses classifies the given catalog outputs into the per-kind
+// breakdown, decompressing only blobs without a current cached classification
+// and best-effort caching any it computes.
+func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTypeStatus {
 	byKind, classified := classifyBlobTypes(blobsDir, outputs)
 	if len(classified) > 0 {
 		// Best effort: cache the classifications so later runs skip
@@ -106,7 +92,7 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 		}
 		return statuses[i].kind.label() < statuses[j].kind.label()
 	})
-	return statuses, nil
+	return statuses
 }
 
 func persistBlobTypes(dbPath string, classified map[string]blobTypeKind) error {
