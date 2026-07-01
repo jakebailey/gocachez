@@ -19,6 +19,7 @@ import (
 type cacheStatus struct {
 	cacheDir         string
 	maxSize          int64
+	maxAge           time.Duration
 	verbose          bool
 	versionDir       string
 	catalogExists    bool
@@ -67,6 +68,7 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"Cache directory", status.cacheDir},
 		{"Version directory", status.versionDir},
 		{"Max size", formatBytes(status.maxSize)},
+		{"Max age", formatMaxAge(status.maxAge)},
 		{"Verbose", strconv.FormatBool(status.verbose)},
 	}); err != nil {
 		return err
@@ -109,6 +111,7 @@ func readStatus(cfg config) (cacheStatus, error) {
 	status := cacheStatus{
 		cacheDir:   cfg.dir,
 		maxSize:    cfg.maxSize,
+		maxAge:     cfg.maxAge,
 		verbose:    cfg.verbose,
 		versionDir: versionDir,
 	}
@@ -358,6 +361,13 @@ func formatMaxUsage(size, maxSize int64) string {
 	percent := float64(size) / float64(maxSize) * 100
 	remaining := maxSize - size
 	return fmt.Sprintf("%s / %s (%.1f%%, %s remaining)", formatBytes(size), formatBytes(maxSize), percent, formatBytes(remaining))
+}
+
+func formatMaxAge(maxAge time.Duration) string {
+	if maxAge <= 0 {
+		return "disabled"
+	}
+	return formatAge(maxAge)
 }
 
 func formatOldestAccess(status catalogStatus, now time.Time) string {

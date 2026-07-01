@@ -1739,6 +1739,7 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, cacheDir)
 	assertContains(t, got, "Max size")
 	assertContains(t, got, "20.0GiB")
+	assertContains(t, got, "Max age            5d")
 	assertContains(t, got, "Verbose")
 	assertContains(t, got, "false")
 	assertContains(t, got, "Summary:\n")
@@ -1765,13 +1766,14 @@ func TestRunStatusShowsEffectiveConfig(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir, "-max-size", "1MiB", "-v"}, strings.NewReader(""), &stdout); err != nil {
+	if err := run([]string{"status", "-dir", cacheDir, "-max-size", "1MiB", "-max-age", "2d", "-v"}, strings.NewReader(""), &stdout); err != nil {
 		t.Fatal(err)
 	}
 	got := stdout.String()
 	assertContains(t, got, "Cache directory")
 	assertContains(t, got, cacheDir)
 	assertContains(t, got, "Max size           1.0MiB")
+	assertContains(t, got, "Max age            2d")
 	assertContains(t, got, "Verbose            true")
 }
 
@@ -2975,6 +2977,22 @@ func TestFormatMaxUsage(t *testing.T) {
 				t.Fatalf("formatMaxUsage(%d, %d) = %q, want %q", tc.size, tc.maxSize, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFormatMaxAge(t *testing.T) {
+	t.Parallel()
+
+	for input, want := range map[time.Duration]string{
+		0:                  "disabled",
+		-time.Hour:         "disabled",
+		5 * 24 * time.Hour: "5d",
+		36 * time.Hour:     "1d 12h",
+		90 * time.Minute:   "1h 30m",
+	} {
+		if got := formatMaxAge(input); got != want {
+			t.Fatalf("formatMaxAge(%v) = %q, want %q", input, got, want)
+		}
 	}
 }
 
