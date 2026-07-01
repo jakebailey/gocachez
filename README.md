@@ -160,6 +160,9 @@ Supported options:
 - Flag: `-max-size`
 - Default: `20GiB`; `0` disables size-based pruning.
 
+Independent of `maxSize`, entries and retained files that have not been used for
+five days are trimmed automatically, matching `cmd/go`'s `GOCACHE`.
+
 **Verbose maintenance logs**
 
 - Config: `verbose`

@@ -138,6 +138,16 @@ WHERE output_id = ?`, outputID)
 	return err
 }
 
+func (c *catalog) deleteEntriesAccessedBefore(ctx context.Context, cutoff int64) (int64, error) {
+	res, err := c.db.ExecContext(ctx, `
+DELETE FROM entries
+WHERE accessed_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
 	var size int64
 	err := c.db.QueryRowContext(ctx, `

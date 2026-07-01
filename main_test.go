@@ -817,7 +817,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	st.close()
 
 	exportPath := retainedPath(cacheDir, outputID, ".a")
-	old := retainedPruneCutoff(time.Now()).Add(-time.Minute)
+	old := trimCutoff(time.Now()).Add(-time.Minute)
 	for _, path := range []string{exportPath, res.DiskPath} {
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
@@ -871,7 +871,7 @@ func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 		st.close()
 		if i == 0 {
 			exportPath := retainedPath(cacheDir, outputID, ".a")
-			old := retainedPruneCutoff(time.Now()).Add(-time.Minute)
+			old := trimCutoff(time.Now()).Add(-time.Minute)
 			if err := os.Chtimes(exportPath, old, old); err != nil {
 				t.Fatal(err)
 			}
@@ -883,7 +883,7 @@ func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.ModTime().After(retainedPruneCutoff(time.Now())) {
+	if !info.ModTime().After(trimCutoff(time.Now())) {
 		t.Fatalf("retained export mtime = %v, want refreshed after cutoff", info.ModTime())
 	}
 }
@@ -1187,10 +1187,11 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		}
 	}
 
+	recent := unixMillis(time.Now())
 	if _, err := st.db.ExecContext(
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		int64(1000),
+		recent-3000,
 		hexOf(oldSharedActionID),
 	); err != nil {
 		t.Fatal(err)
@@ -1198,7 +1199,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	if _, err := st.db.ExecContext(
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		int64(3000),
+		recent-1000,
 		hexOf(newSharedActionID),
 	); err != nil {
 		t.Fatal(err)
@@ -1206,7 +1207,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	if _, err := st.db.ExecContext(
 		context.Background(),
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
-		int64(2000),
+		recent-2000,
 		hexOf(prunedActionID),
 	); err != nil {
 		t.Fatal(err)
@@ -1239,6 +1240,89 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned: %v", err)
+	}
+}
+
+func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	oldActionID := bytes.Repeat([]byte{20}, 32)
+	oldOutputID := bytes.Repeat([]byte{21}, 32)
+	freshActionID := bytes.Repeat([]byte{22}, 32)
+	freshOutputID := bytes.Repeat([]byte{23}, 32)
+	sharedOutputID := bytes.Repeat([]byte{24}, 32)
+	oldSharedActionID := bytes.Repeat([]byte{25}, 32)
+	freshSharedActionID := bytes.Repeat([]byte{26}, 32)
+	body := bytes.Repeat([]byte("x"), 64)
+
+	for _, tc := range []struct {
+		actionID []byte
+		outputID []byte
+	}{
+		{oldActionID, oldOutputID},
+		{freshActionID, freshOutputID},
+		{oldSharedActionID, sharedOutputID},
+		{freshSharedActionID, sharedOutputID},
+	} {
+		if _, err := st.put(request{
+			ID:       1,
+			Command:  cmdPut,
+			ActionID: tc.actionID,
+			OutputID: tc.outputID,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stale := unixMillis(trimCutoff(time.Now())) - int64(time.Minute/time.Millisecond)
+	for _, actionID := range [][]byte{oldActionID, oldSharedActionID} {
+		if _, err := st.db.ExecContext(
+			context.Background(),
+			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
+			stale,
+			hexOf(actionID),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(oldActionID)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("stale entry was not pruned: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(oldOutputID))); !os.IsNotExist(err) {
+		t.Fatalf("stale entry blob stat err = %v, want not exist", err)
+	}
+	if _, err := st.lookupEntry(hexOf(freshActionID)); err != nil {
+		t.Fatalf("fresh entry was pruned: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(freshOutputID))); err != nil {
+		t.Fatalf("fresh entry blob was pruned: %v", err)
+	}
+	if _, err := st.lookupEntry(hexOf(oldSharedActionID)); !errorsIs(err, sql.ErrNoRows) {
+		t.Fatalf("stale shared action was not pruned: %v", err)
+	}
+	if _, err := st.lookupEntry(hexOf(freshSharedActionID)); err != nil {
+		t.Fatalf("fresh shared action was pruned: %v", err)
+	}
+	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
+		t.Fatalf("shared output blob was pruned while still referenced: %v", err)
 	}
 }
 

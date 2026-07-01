@@ -23,8 +23,11 @@ import (
 var errInvalidCacheEntry = errors.New("invalid cache entry")
 
 const (
-	retainedMTimeInterval = time.Hour
-	retainedTrimLimit     = 5 * 24 * time.Hour
+	// mtimeInterval and trimLimit mirror cmd/go's DiskCache trim policy: cache
+	// entries and retained files that have not been used for trimLimit are
+	// removed regardless of the cache's size, matching GOCACHE.
+	mtimeInterval = time.Hour
+	trimLimit     = 5 * 24 * time.Hour
 )
 
 var decoderOptions = []zstd.DOption{
@@ -376,6 +379,9 @@ func (st *store) pruneLocked() error {
 	if err := st.pruneOldRetainedLiveDirs(time.Now()); err != nil {
 		return err
 	}
+	if err := st.pruneOldEntries(time.Now()); err != nil {
+		return err
+	}
 	if err := st.removeOrphanRetainedFiles(); err != nil {
 		return err
 	}
@@ -467,6 +473,18 @@ func (st *store) removeOrphanRetainedFiles() error {
 	})
 }
 
+func (st *store) pruneOldEntries(now time.Time) error {
+	cutoff := unixMillis(trimCutoff(now))
+	removed, err := st.q.deleteEntriesAccessedBefore(context.Background(), cutoff)
+	if err != nil {
+		return fmt.Errorf("prune old entries: %w", err)
+	}
+	if st.verbose && removed > 0 {
+		log.Printf("gocachez: pruned %d entries not used in %s", removed, trimLimit)
+	}
+	return nil
+}
+
 func (st *store) pruneOldRetainedFiles(now time.Time) error {
 	root := retainedRoot(st.versionDir)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
@@ -474,7 +492,7 @@ func (st *store) pruneOldRetainedFiles(now time.Time) error {
 	} else if err != nil {
 		return fmt.Errorf("stat retained root: %w", err)
 	}
-	cutoff := retainedPruneCutoff(now)
+	cutoff := trimCutoff(now)
 	removed := 0
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -512,7 +530,7 @@ func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("read live dir: %w", err)
 	}
-	cutoff := retainedPruneCutoff(now)
+	cutoff := trimCutoff(now)
 	removed := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -580,8 +598,8 @@ func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
 	return true, nil
 }
 
-func retainedPruneCutoff(now time.Time) time.Time {
-	return now.Add(-retainedTrimLimit - retainedMTimeInterval)
+func trimCutoff(now time.Time) time.Time {
+	return now.Add(-trimLimit - mtimeInterval)
 }
 
 func markRetainedFileUsed(path string) error {
@@ -590,7 +608,7 @@ func markRetainedFileUsed(path string) error {
 		return err
 	}
 	now := time.Now()
-	if now.Sub(info.ModTime()) < retainedMTimeInterval {
+	if now.Sub(info.ModTime()) < mtimeInterval {
 		return nil
 	}
 	return os.Chtimes(path, now, now)
