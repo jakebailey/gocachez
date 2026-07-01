@@ -134,14 +134,28 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 }
 
 func parseRunArgs(args []string) (config, runMode, error) {
+	mode := runModeProtocol
+	rest := args
 	if len(args) != 0 && isRunMode(args[0]) {
-		cfg, err := parseFlags(args[1:])
-		return cfg, runMode(args[0]), err
+		mode = runMode(args[0])
+		rest = args[1:]
 	}
-
-	cfg, err := parseFlags(args)
-	return cfg, runModeProtocol, err
+	cfg, err := parseFlags(rest)
+	if ae := (*argError)(nil); errors.As(err, &ae) {
+		return cfg, mode, &usageError{mode: mode, err: ae.err}
+	}
+	return cfg, mode, err
 }
+
+// usageError is an argError paired with the command it applies to, so callers
+// can print the matching usage.
+type usageError struct {
+	mode runMode
+	err  error
+}
+
+func (e *usageError) Error() string { return e.err.Error() }
+func (e *usageError) Unwrap() error { return e.err }
 
 func stdoutIsTerminal(stdout io.Writer) bool {
 	f, ok := stdout.(*os.File)

@@ -31,10 +31,18 @@ func parseFlags(args []string) (config, error) {
 		return config{}, err
 	}
 	if len(operands) != 0 {
-		return config{}, fmt.Errorf("unexpected argument %q", operands[0])
+		return config{}, &argError{fmt.Errorf("unexpected argument %q", operands[0])}
 	}
 	return cfg, nil
 }
+
+// argError marks a command-line parsing failure (an unknown flag or argument)
+// as distinct from a configuration or value error, so callers can respond by
+// printing usage.
+type argError struct{ err error }
+
+func (e *argError) Error() string { return e.err.Error() }
+func (e *argError) Unwrap() error { return e.err }
 
 func parseFlagOperands(args []string) (config, []string, error) {
 	cfg, err := defaultConfig()
@@ -55,7 +63,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	fs.StringVar(&cfg.memProfile, "memprofile", "", "write memory profile to file")
 	if err := fs.Parse(args); err != nil {
-		return config{}, nil, err
+		return config{}, nil, &argError{err}
 	}
 
 	visited := map[string]bool{}

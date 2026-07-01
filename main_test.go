@@ -2226,6 +2226,51 @@ func TestRunProtocolIgnoresTerminalCheckForPipes(t *testing.T) {
 	}
 }
 
+func TestRunReportsUsageErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		mode runMode
+	}{
+		{"unknown flag", []string{"-bogus"}, runModeProtocol},
+		{"missing flag value", []string{"-dir"}, runModeProtocol},
+		{"unknown subcommand", []string{"bogus"}, runModeProtocol},
+		{"status unknown flag", []string{"status", "-bogus"}, runModeStatus},
+		{"clean stray argument", []string{"clean", "extra"}, runModeClean},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var stdout bytes.Buffer
+			err := run(tc.args, strings.NewReader(""), &stdout)
+			var ue *usageError
+			if !errors.As(err, &ue) {
+				t.Fatalf("error = %v, want usageError", err)
+			}
+			if ue.mode != tc.mode {
+				t.Fatalf("mode = %q, want %q", ue.mode, tc.mode)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("usage errors must not write to stdout; got %q", stdout.String())
+			}
+		})
+	}
+}
+
+func TestRunValueErrorIsNotUsageError(t *testing.T) {
+	t.Parallel()
+
+	err := run([]string{"-dir", t.TempDir(), "-max-size", "wat"}, strings.NewReader(""), &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("run accepted bad max-size")
+	}
+	var ue *usageError
+	if errors.As(err, &ue) {
+		t.Fatalf("value error classified as usageError: %v", err)
+	}
+}
+
 func TestRunWritesProfiles(t *testing.T) {
 	dir := t.TempDir()
 	cpuProfile := filepath.Join(dir, "cpu.pprof")
