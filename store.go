@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS entries (
 	blob_type INTEGER,
 	blob_type_version INTEGER
 );
-CREATE INDEX IF NOT EXISTS entries_output_id ON entries(output_id);
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -253,6 +252,15 @@ func migrateSchema(ctx context.Context, db catalogDB) error {
 				return fmt.Errorf("add entries.%s column: %w", col.name, err)
 			}
 		}
+	}
+	// Covering index for the status GROUP BY output_id scan (sizes + cached blob
+	// type). Created here rather than in catalogSchema because it references the
+	// blob-type columns added above; it supersedes a plain output_id index.
+	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version)`); err != nil {
+		return fmt.Errorf("create entries_output_cover index: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_id`); err != nil {
+		return fmt.Errorf("drop entries_output_id index: %w", err)
 	}
 	return nil
 }

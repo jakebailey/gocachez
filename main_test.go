@@ -2099,7 +2099,8 @@ CREATE TABLE entries (
 	compressed_size INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL
-)`); err != nil {
+);
+CREATE INDEX entries_output_id ON entries(output_id)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2126,6 +2127,25 @@ CREATE TABLE entries (
 			t.Fatalf("column %s missing after migration", col)
 		}
 	}
+
+	// The plain output_id index is replaced by the covering index.
+	if has, err := indexExists(ctx, db, "entries_output_cover"); err != nil {
+		t.Fatal(err)
+	} else if !has {
+		t.Fatal("entries_output_cover missing after migration")
+	}
+	if has, err := indexExists(ctx, db, "entries_output_id"); err != nil {
+		t.Fatal(err)
+	} else if has {
+		t.Fatal("entries_output_id present after migration")
+	}
+}
+
+func indexExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&count)
+	return count > 0, err
 }
 
 func assertBlobKind(t *testing.T, statuses []blobTypeStatus, kind blobTypeKind, count int64) {
