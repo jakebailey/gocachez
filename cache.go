@@ -23,11 +23,10 @@ import (
 var errInvalidCacheEntry = errors.New("invalid cache entry")
 
 const (
-	// mtimeInterval and trimLimit mirror cmd/go's DiskCache trim policy: cache
-	// entries and retained files that have not been used for trimLimit are
-	// removed regardless of the cache's size, matching GOCACHE.
+	// mtimeInterval mirrors cmd/go's DiskCache: retained-file mtimes are updated
+	// at most once per interval to avoid churn. The age cutoff itself is the
+	// configurable maxAge (see config); the default matches GOCACHE's 5 days.
 	mtimeInterval = time.Hour
-	trimLimit     = 5 * 24 * time.Hour
 )
 
 var decoderOptions = []zstd.DOption{
@@ -471,25 +470,31 @@ func (st *store) removeOrphanRetainedFiles() error {
 }
 
 func (st *store) pruneOldEntries(now time.Time) error {
-	cutoff := unixMillis(trimCutoff(now))
+	if st.maxAge <= 0 {
+		return nil
+	}
+	cutoff := unixMillis(trimCutoff(st.maxAge, now))
 	removed, err := st.q.deleteEntriesAccessedBefore(context.Background(), cutoff)
 	if err != nil {
 		return fmt.Errorf("prune old entries: %w", err)
 	}
 	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d entries not used in %s", removed, trimLimit)
+		log.Printf("gocachez: pruned %d entries not used in %s", removed, st.maxAge)
 	}
 	return nil
 }
 
 func (st *store) pruneOldRetainedFiles(now time.Time) error {
+	if st.maxAge <= 0 {
+		return nil
+	}
 	root := retainedRoot(st.versionDir)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("stat retained root: %w", err)
 	}
-	cutoff := trimCutoff(now)
+	cutoff := trimCutoff(st.maxAge, now)
 	removed := 0
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -520,6 +525,9 @@ func (st *store) pruneOldRetainedFiles(now time.Time) error {
 }
 
 func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
+	if st.maxAge <= 0 {
+		return nil
+	}
 	entries, err := os.ReadDir(st.liveRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -527,7 +535,7 @@ func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("read live dir: %w", err)
 	}
-	cutoff := trimCutoff(now)
+	cutoff := trimCutoff(st.maxAge, now)
 	removed := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -595,8 +603,8 @@ func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
 	return true, nil
 }
 
-func trimCutoff(now time.Time) time.Time {
-	return now.Add(-trimLimit - mtimeInterval)
+func trimCutoff(maxAge time.Duration, now time.Time) time.Time {
+	return now.Add(-maxAge - mtimeInterval)
 }
 
 func markRetainedFileUsed(path string) error {

@@ -134,6 +134,7 @@ Example config:
 {
     "cacheDir": "/path/to/gocachez",
     "maxSize": "20GiB",
+    "maxAge": "5d",
     "verbose": false
 }
 ```
@@ -160,8 +161,17 @@ Supported options:
 - Flag: `-max-size`
 - Default: `20GiB`; `0` disables size-based pruning.
 
-Independent of `maxSize`, entries and retained files that have not been used for
-five days are trimmed automatically, matching `cmd/go`'s `GOCACHE`.
+**Maximum age of unused entries**
+
+- Config: `maxAge`
+- Environment: `GOCACHEZ_MAX_AGE`
+- Flag: `-max-age`
+- Default: `5d`, matching `cmd/go`'s `GOCACHE`; `0` disables age-based pruning.
+  Accepts a duration such as `5d`, `36h`, or `90m`.
+
+Age-based pruning is independent of `maxSize`: entries and retained files that
+have not been used within `maxAge` are trimmed even while the cache is under its
+size limit.
 
 **Verbose maintenance logs**
 

@@ -817,7 +817,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	st.close()
 
 	exportPath := retainedPath(cacheDir, outputID, ".a")
-	old := trimCutoff(time.Now()).Add(-time.Minute)
+	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
 	for _, path := range []string{exportPath, res.DiskPath} {
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
@@ -825,7 +825,8 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	}
 
 	st, err = newStore(config{
-		dir: cacheDir,
+		dir:    cacheDir,
+		maxAge: defaultMaxAge,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -854,7 +855,8 @@ func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 	outputID := bytes.Repeat([]byte{66}, 32)
 	for i := range 2 {
 		st, err := newStore(config{
-			dir: cacheDir,
+			dir:    cacheDir,
+			maxAge: defaultMaxAge,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -871,7 +873,7 @@ func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 		st.close()
 		if i == 0 {
 			exportPath := retainedPath(cacheDir, outputID, ".a")
-			old := trimCutoff(time.Now()).Add(-time.Minute)
+			old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
 			if err := os.Chtimes(exportPath, old, old); err != nil {
 				t.Fatal(err)
 			}
@@ -883,7 +885,7 @@ func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.ModTime().After(trimCutoff(time.Now())) {
+	if !info.ModTime().After(trimCutoff(defaultMaxAge, time.Now())) {
 		t.Fatalf("retained export mtime = %v, want refreshed after cutoff", info.ModTime())
 	}
 }
@@ -1249,6 +1251,7 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	st, err := newStore(config{
 		dir:     t.TempDir(),
 		maxSize: 0,
+		maxAge:  defaultMaxAge,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1284,7 +1287,7 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 		}
 	}
 
-	stale := unixMillis(trimCutoff(time.Now())) - int64(time.Minute/time.Millisecond)
+	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
 	for _, actionID := range [][]byte{oldActionID, oldSharedActionID} {
 		if _, err := st.db.ExecContext(
 			context.Background(),
@@ -1323,6 +1326,52 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned while still referenced: %v", err)
+	}
+}
+
+func TestPruneKeepsOldEntriesWhenMaxAgeDisabled(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 0,
+		maxAge:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	actionID := bytes.Repeat([]byte{40}, 32)
+	outputID := bytes.Repeat([]byte{41}, 32)
+	body := bytes.Repeat([]byte("x"), 64)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.db.ExecContext(
+		context.Background(),
+		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
+		int64(1000),
+		hexOf(actionID),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
+		t.Fatalf("entry pruned with age-based pruning disabled: %v", err)
 	}
 }
 
@@ -2568,6 +2617,7 @@ func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
 	configJSON := `{
 		"cacheDir": ` + strconvQuote(cacheDir) + `,
 		"maxSize": "123MiB",
+		"maxAge": "3d",
 		"verbose": true
 	}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
@@ -2583,6 +2633,9 @@ func TestParseFlagsLoadsDefaultConfigFile(t *testing.T) {
 	}
 	if cfg.maxSize != 123<<20 {
 		t.Fatalf("maxSize = %d, want %d", cfg.maxSize, 123<<20)
+	}
+	if cfg.maxAge != 3*24*time.Hour {
+		t.Fatalf("maxAge = %v, want %v", cfg.maxAge, 3*24*time.Hour)
 	}
 	if !cfg.verbose {
 		t.Fatal("verbose = false, want true")
@@ -2604,6 +2657,9 @@ func TestParseFlagsUsesUserCacheDirDefault(t *testing.T) {
 	if cfg.dir != want {
 		t.Fatalf("dir = %q, want %q", cfg.dir, want)
 	}
+	if cfg.maxAge != defaultMaxAge {
+		t.Fatalf("maxAge = %v, want %v", cfg.maxAge, defaultMaxAge)
+	}
 }
 
 func TestParseFlagsRequiresExplicitConfig(t *testing.T) {
@@ -2617,12 +2673,12 @@ func TestParseFlagsOverrideConfigFile(t *testing.T) {
 	configPath := filepath.Join(configDir, "config.json")
 	configCacheDir := filepath.Join(configDir, "config-cache")
 	flagCacheDir := filepath.Join(configDir, "flag-cache")
-	configJSON := `{"cacheDir": ` + strconvQuote(configCacheDir) + `, "maxSize": "10MiB"}`
+	configJSON := `{"cacheDir": ` + strconvQuote(configCacheDir) + `, "maxSize": "10MiB", "maxAge": "10d"}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o666); err != nil {
 		t.Fatal(err)
 	}
 
-	cfg, err := parseFlags([]string{"-config", configPath, "-dir", flagCacheDir, "-max-size", "1MiB"})
+	cfg, err := parseFlags([]string{"-config", configPath, "-dir", flagCacheDir, "-max-size", "1MiB", "-max-age", "2d"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2632,12 +2688,16 @@ func TestParseFlagsOverrideConfigFile(t *testing.T) {
 	if cfg.maxSize != 1<<20 {
 		t.Fatalf("maxSize = %d, want %d", cfg.maxSize, 1<<20)
 	}
+	if cfg.maxAge != 2*24*time.Hour {
+		t.Fatalf("maxAge = %v, want %v", cfg.maxAge, 2*24*time.Hour)
+	}
 }
 
 func TestParseFlagsUsesEnvironmentOverrides(t *testing.T) {
 	cacheDir := t.TempDir()
 	t.Setenv("GOCACHEZ_DIR", cacheDir)
 	t.Setenv("GOCACHEZ_MAX_SIZE", "7MiB")
+	t.Setenv("GOCACHEZ_MAX_AGE", "36h")
 	t.Setenv("GOCACHEZ_VERBOSE", "true")
 	t.Setenv("GOCACHEZ_CONFIG", "")
 
@@ -2650,6 +2710,9 @@ func TestParseFlagsUsesEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.maxSize != 7<<20 {
 		t.Fatalf("maxSize = %d, want %d", cfg.maxSize, 7<<20)
+	}
+	if cfg.maxAge != 36*time.Hour {
+		t.Fatalf("maxAge = %v, want %v", cfg.maxAge, 36*time.Hour)
 	}
 	if !cfg.verbose {
 		t.Fatal("verbose = false, want true")
@@ -2672,12 +2735,20 @@ func TestParseFlagsRejectsInvalidInputs(t *testing.T) {
 	if _, err := parseFlags([]string{"-dir", t.TempDir(), "-max-size", "bad"}); err == nil {
 		t.Fatal("parseFlags accepted bad max size")
 	}
+	if _, err := parseFlags([]string{"-dir", t.TempDir(), "-max-age", "bad"}); err == nil {
+		t.Fatal("parseFlags accepted bad max age")
+	}
 
 	t.Setenv("GOCACHEZ_MAX_SIZE", "bad")
 	if _, err := parseFlags([]string{"-dir", t.TempDir()}); err == nil {
 		t.Fatal("parseFlags accepted bad GOCACHEZ_MAX_SIZE")
 	}
 	t.Setenv("GOCACHEZ_MAX_SIZE", "")
+	t.Setenv("GOCACHEZ_MAX_AGE", "bad")
+	if _, err := parseFlags([]string{"-dir", t.TempDir()}); err == nil {
+		t.Fatal("parseFlags accepted bad GOCACHEZ_MAX_AGE")
+	}
+	t.Setenv("GOCACHEZ_MAX_AGE", "")
 	t.Setenv("GOCACHEZ_VERBOSE", "bad")
 	if _, err := parseFlags([]string{"-dir", t.TempDir()}); err == nil {
 		t.Fatal("parseFlags accepted bad GOCACHEZ_VERBOSE")
@@ -2733,6 +2804,32 @@ func TestParseSizeErrors(t *testing.T) {
 	for _, input := range []string{"", "MiB", "1bad", "-1", "."} {
 		if _, err := parseSize(input); err == nil {
 			t.Fatalf("parseSize(%q) succeeded", input)
+		}
+	}
+}
+
+func TestParseAge(t *testing.T) {
+	t.Parallel()
+
+	for input, want := range map[string]time.Duration{
+		"0":    0,
+		"5d":   5 * 24 * time.Hour,
+		"1.5d": 36 * time.Hour,
+		"36h":  36 * time.Hour,
+		"90m":  90 * time.Minute,
+	} {
+		got, err := parseAge(input)
+		if err != nil {
+			t.Fatalf("parseAge(%q) error: %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("parseAge(%q) = %v, want %v", input, got, want)
+		}
+	}
+
+	for _, input := range []string{"", "d", "-5d", "-1h", "wat", "5x"} {
+		if _, err := parseAge(input); err == nil {
+			t.Fatalf("parseAge(%q) succeeded", input)
 		}
 	}
 }

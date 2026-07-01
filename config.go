@@ -9,11 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
+
+// defaultMaxAge is the default cutoff for age-based pruning, matching cmd/go's
+// GOCACHE trim window.
+const defaultMaxAge = 5 * 24 * time.Hour
 
 type config struct {
 	dir        string
 	maxSize    int64
+	maxAge     time.Duration
 	verbose    bool
 	cpuProfile string
 	memProfile string
@@ -22,6 +28,7 @@ type config struct {
 type fileConfig struct {
 	CacheDir *string `json:"cacheDir"`
 	MaxSize  *string `json:"maxSize"`
+	MaxAge   *string `json:"maxAge"`
 	Verbose  *bool   `json:"verbose"`
 }
 
@@ -51,7 +58,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	}
 	configPath, configRequired := defaultConfigPath()
 
-	var flagDir, flagMaxSize string
+	var flagDir, flagMaxSize, flagMaxAge string
 	var flagVerbose bool
 
 	fs := flag.NewFlagSet("gocachez", flag.ContinueOnError)
@@ -59,6 +66,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	fs.StringVar(&configPath, "config", configPath, "JSON config file")
 	fs.StringVar(&flagDir, "dir", "", "cache directory")
 	fs.StringVar(&flagMaxSize, "max-size", "", "maximum compressed cache size, or 0 to disable pruning")
+	fs.StringVar(&flagMaxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
 	fs.BoolVar(&flagVerbose, "v", false, "log cache maintenance to stderr")
 	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	fs.StringVar(&cfg.memProfile, "memprofile", "", "write memory profile to file")
@@ -87,6 +95,11 @@ func parseFlagOperands(args []string) (config, []string, error) {
 			return config{}, nil, fmt.Errorf("parse GOCACHEZ_MAX_SIZE: %w", err)
 		}
 	}
+	if value := os.Getenv("GOCACHEZ_MAX_AGE"); value != "" {
+		if cfg.maxAge, err = parseAge(value); err != nil {
+			return config{}, nil, fmt.Errorf("parse GOCACHEZ_MAX_AGE: %w", err)
+		}
+	}
 	if value := os.Getenv("GOCACHEZ_VERBOSE"); value != "" {
 		if cfg.verbose, err = strconv.ParseBool(value); err != nil {
 			return config{}, nil, fmt.Errorf("parse GOCACHEZ_VERBOSE: %w", err)
@@ -99,6 +112,11 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	if visited["max-size"] {
 		if cfg.maxSize, err = parseSize(flagMaxSize); err != nil {
 			return config{}, nil, fmt.Errorf("parse -max-size: %w", err)
+		}
+	}
+	if visited["max-age"] {
+		if cfg.maxAge, err = parseAge(flagMaxAge); err != nil {
+			return config{}, nil, fmt.Errorf("parse -max-age: %w", err)
 		}
 	}
 	if visited["v"] {
@@ -125,6 +143,7 @@ func defaultConfig() (config, error) {
 	return config{
 		dir:     filepath.Join(userCacheDir, "gocachez"),
 		maxSize: maxSize,
+		maxAge:  defaultMaxAge,
 	}, nil
 }
 
@@ -165,6 +184,13 @@ func applyFileConfig(cfg *config, fc fileConfig) error {
 			return fmt.Errorf("parse config maxSize: %w", err)
 		}
 		cfg.maxSize = maxSize
+	}
+	if fc.MaxAge != nil {
+		maxAge, err := parseAge(*fc.MaxAge)
+		if err != nil {
+			return fmt.Errorf("parse config maxAge: %w", err)
+		}
+		cfg.maxAge = maxAge
 	}
 	if fc.Verbose != nil {
 		cfg.verbose = *fc.Verbose

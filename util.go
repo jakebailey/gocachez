@@ -61,6 +61,35 @@ func parseSize(s string) (int64, error) {
 	return int64(value * float64(multiplier)), nil
 }
 
+// parseAge parses a duration like "5d", "36h", or "90m". It extends
+// time.ParseDuration with a "d" (days) unit since ages are usually days, and
+// treats "0" as disabled.
+func parseAge(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, errors.New("empty duration")
+	}
+	if s == "0" {
+		return 0, nil
+	}
+
+	var d time.Duration
+	var err error
+	if rest, ok := strings.CutSuffix(s, "d"); ok {
+		var days float64
+		if days, err = strconv.ParseFloat(rest, 64); err != nil {
+			return 0, fmt.Errorf("parse duration %q: %w", s, err)
+		}
+		d = time.Duration(days * float64(24*time.Hour))
+	} else if d, err = time.ParseDuration(s); err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("negative duration %q", s)
+	}
+	return d, nil
+}
+
 var sizeUnits = map[string]int64{
 	"":    1,
 	"b":   1,

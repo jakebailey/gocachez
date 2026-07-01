@@ -48,6 +48,7 @@ Flags:
   -config path    JSON config file
   -dir path       cache directory
   -max-size size  maximum compressed cache size, or 0 to disable pruning
+  -max-age dur    maximum age of unused entries, or 0 to disable age-based pruning
   -v              log cache maintenance to stderr
   -h              show help
 `
