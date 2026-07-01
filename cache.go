@@ -221,12 +221,9 @@ func (st *store) flushAccessTimes() error {
 	if err != nil {
 		return fmt.Errorf("begin access-time transaction: %w", err)
 	}
-	qtx := st.q.withTx(tx)
-	for actionID, accessedAt := range accessed {
-		if err := qtx.touchEntry(ctx, actionID, accessedAt); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("touch entry: %w", err)
-		}
+	if err := st.q.touchEntries(ctx, tx, accessed); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit access-time transaction: %w", err)

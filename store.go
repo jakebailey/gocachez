@@ -144,7 +144,16 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
 	}
+	if err := st.q.prepare(context.Background()); err != nil {
+		_ = st.q.close()
+		_ = db.Close()
+		_ = runLock.Unlock()
+		_ = runLock.Close()
+		_ = os.RemoveAll(runDir)
+		return nil, err
+	}
 	if err := st.registerRun(); err != nil {
+		_ = st.q.close()
 		_ = db.Close()
 		_ = runLock.Unlock()
 		_ = runLock.Close()
@@ -274,6 +283,9 @@ func (st *store) close() {
 	}
 	if err := st.prune(); err != nil && st.verbose {
 		log.Printf("gocachez: prune failed: %v", err)
+	}
+	if err := st.q.close(); err != nil && st.verbose {
+		log.Printf("gocachez: close prepared statements failed: %v", err)
 	}
 	if err := st.db.Close(); err != nil && st.verbose {
 		log.Printf("gocachez: close catalog failed: %v", err)

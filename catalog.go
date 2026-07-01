@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 )
 
 type catalogDB interface {
@@ -11,8 +13,35 @@ type catalogDB interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// lookupEntrySQL and upsertEntrySQL are the per-request hot-path queries. They
+// are prepared once on the store's connection (see catalog.prepare) so modernc
+// does not re-parse them on every get/put.
+const lookupEntrySQL = `
+SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
+FROM entries
+WHERE action_id = ?`
+
+const upsertEntrySQL = `
+INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(action_id) DO UPDATE SET
+	output_id = excluded.output_id,
+	size = excluded.size,
+	compressed_size = excluded.compressed_size,
+	created_at = excluded.created_at,
+	accessed_at = excluded.accessed_at,
+	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END`
+
+const touchEntrySQL = `
+UPDATE entries
+SET accessed_at = ?
+WHERE action_id = ?`
+
 type catalog struct {
-	db catalogDB
+	db         catalogDB
+	lookupStmt *sql.Stmt
+	upsertStmt *sql.Stmt
+	touchStmt  *sql.Stmt
 }
 
 type catalogRun struct {
@@ -30,6 +59,37 @@ type catalogOutput struct {
 
 func newCatalog(db catalogDB) *catalog {
 	return &catalog{db: db}
+}
+
+// prepare caches the hot-path statements on a persistent *sql.DB connection.
+// It is a no-op for transaction-backed catalogs (from withTx), which fall back
+// to parsing per call.
+func (c *catalog) prepare(ctx context.Context) error {
+	db, ok := c.db.(*sql.DB)
+	if !ok {
+		return nil
+	}
+	var err error
+	if c.lookupStmt, err = db.PrepareContext(ctx, lookupEntrySQL); err != nil {
+		return fmt.Errorf("prepare lookup statement: %w", err)
+	}
+	if c.upsertStmt, err = db.PrepareContext(ctx, upsertEntrySQL); err != nil {
+		return fmt.Errorf("prepare upsert statement: %w", err)
+	}
+	if c.touchStmt, err = db.PrepareContext(ctx, touchEntrySQL); err != nil {
+		return fmt.Errorf("prepare touch statement: %w", err)
+	}
+	return nil
+}
+
+func (c *catalog) close() error {
+	var err error
+	for _, stmt := range []*sql.Stmt{c.lookupStmt, c.upsertStmt, c.touchStmt} {
+		if stmt != nil {
+			err = errors.Join(err, stmt.Close())
+		}
+	}
+	return err
 }
 
 func (c *catalog) withTx(tx *sql.Tx) *catalog {
@@ -83,33 +143,33 @@ WHERE run_id = ?`, runID)
 }
 
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
-	_, err := c.db.ExecContext(ctx, `
-INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(action_id) DO UPDATE SET
-	output_id = excluded.output_id,
-	size = excluded.size,
-	compressed_size = excluded.compressed_size,
-	created_at = excluded.created_at,
-	accessed_at = excluded.accessed_at,
-	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END`,
+	args := []any{
 		ent.ActionID,
 		ent.OutputID,
 		ent.Size,
 		ent.CompressedSize,
 		unixMillis(ent.CreatedAt),
 		unixMillis(ent.AccessedAt),
-	)
+	}
+	var err error
+	if c.upsertStmt != nil {
+		_, err = c.upsertStmt.ExecContext(ctx, args...)
+	} else {
+		_, err = c.db.ExecContext(ctx, upsertEntrySQL, args...)
+	}
 	return err
 }
 
 func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, error) {
+	var row *sql.Row
+	if c.lookupStmt != nil {
+		row = c.lookupStmt.QueryRowContext(ctx, actionID)
+	} else {
+		row = c.db.QueryRowContext(ctx, lookupEntrySQL, actionID)
+	}
 	var ent entry
 	var createdAt, accessedAt int64
-	err := c.db.QueryRowContext(ctx, `
-SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
-FROM entries
-WHERE action_id = ?`, actionID).Scan(
+	err := row.Scan(
 		&ent.ActionID,
 		&ent.OutputID,
 		&ent.Size,
@@ -125,12 +185,25 @@ WHERE action_id = ?`, actionID).Scan(
 	return ent, nil
 }
 
-func (c *catalog) touchEntry(ctx context.Context, actionID string, accessedAt int64) error {
-	_, err := c.db.ExecContext(ctx, `
-UPDATE entries
-SET accessed_at = ?
-WHERE action_id = ?`, accessedAt, actionID)
-	return err
+// touchEntries updates the access time of many entries in a single transaction,
+// reusing the prepared statement (bound to tx) so the update is parsed once.
+func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[string]int64) error {
+	if c.touchStmt == nil {
+		for actionID, accessedAt := range accessed {
+			if _, err := tx.ExecContext(ctx, touchEntrySQL, accessedAt, actionID); err != nil {
+				return fmt.Errorf("touch entry: %w", err)
+			}
+		}
+		return nil
+	}
+	stmt := tx.StmtContext(ctx, c.touchStmt)
+	defer stmt.Close() //nolint:errcheck
+	for actionID, accessedAt := range accessed {
+		if _, err := stmt.ExecContext(ctx, accessedAt, actionID); err != nil {
+			return fmt.Errorf("touch entry: %w", err)
+		}
+	}
+	return nil
 }
 
 func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
