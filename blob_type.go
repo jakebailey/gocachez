@@ -17,8 +17,18 @@ import (
 
 const blobTypePrefixLimit = 64 << 10
 
+// blobClassifierVersion identifies the behavior of classifyBlobData. Cached
+// classifications are stored with the version that produced them (see
+// entries.blob_type_version); bump this whenever the classification logic
+// changes so status ignores and recomputes stale cached values.
+const blobClassifierVersion = 1
+
 type blobTypeKind int
 
+// blobTypeKind values are persisted in the catalog's entries.blob_type column as
+// a classification cache, so existing constants must not be renumbered; append
+// new kinds at the end. Prefer bumping blobClassifierVersion when detection
+// changes so old cached values are recomputed.
 const (
 	blobTypeGoPackageArchive blobTypeKind = iota
 	blobTypeGoPackageIndex
@@ -63,14 +73,29 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close() //nolint:errcheck
 
-	outputs, err := newCatalog(db).listOutputs(context.Background())
+	ctx := context.Background()
+	cat := newCatalog(db)
+	// The versioned query below reads blob_type_version; older caches migrate to
+	// both blob-type columns together, so gate on the one the query depends on.
+	hasType, err := entriesHasColumn(ctx, db, "blob_type_version")
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("inspect catalog schema: %w", err)
+	}
+	outputs, err := cat.listOutputs(ctx, hasType, blobClassifierVersion)
+	_ = db.Close()
 	if err != nil {
 		return nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
 
-	byKind := classifyBlobTypes(blobsDir, outputs)
+	byKind, classified := classifyBlobTypes(blobsDir, outputs)
+	if len(classified) > 0 {
+		// Best effort: cache the classifications so later runs skip
+		// decompressing these blobs. Ignore failures (e.g. a read-only cache).
+		_ = persistBlobTypes(dbPath, classified)
+	}
+
 	statuses := make([]blobTypeStatus, 0, len(byKind))
 	for _, status := range byKind {
 		statuses = append(statuses, *status)
@@ -84,18 +109,54 @@ func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
 	return statuses, nil
 }
 
+func persistBlobTypes(dbPath string, classified map[string]blobTypeKind) error {
+	db, err := openDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	qtx := newCatalog(db).withTx(tx)
+	for outputID, kind := range classified {
+		if err := qtx.updateBlobType(ctx, outputID, kind, blobClassifierVersion); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 type blobTypeResult struct {
 	output         catalogOutput
 	classification blobClassification
 }
 
-func classifyBlobTypes(blobsDir string, outputs []catalogOutput) map[blobTypeKind]*blobTypeStatus {
+// classifyBlobTypes aggregates the blobs for outputs by classification. Outputs
+// carrying a cached classification (blobType) reuse it; the rest are
+// decompressed and classified in parallel, and returned so the caller can cache
+// them.
+func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKind]*blobTypeStatus, map[string]blobTypeKind) {
 	byKind := make(map[blobTypeKind]*blobTypeStatus)
-	if len(outputs) == 0 {
-		return byKind
+	classified := make(map[string]blobTypeKind)
+
+	var pending []catalogOutput
+	for _, output := range outputs {
+		if output.blobType.Valid {
+			addBlobType(byKind, blobTypeKind(output.blobType.Int64), output)
+			continue
+		}
+		pending = append(pending, output)
+	}
+	if len(pending) == 0 {
+		return byKind, classified
 	}
 
-	workers := min(len(outputs), min(max(runtime.GOMAXPROCS(0), 1), 8))
+	workers := min(len(pending), min(max(runtime.GOMAXPROCS(0), 1), 8))
 	jobs := make(chan catalogOutput)
 	results := make(chan blobTypeResult, workers)
 
@@ -120,7 +181,7 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) map[blobTypeKin
 	}
 
 	go func() {
-		for _, output := range outputs {
+		for _, output := range pending {
 			jobs <- output
 		}
 		close(jobs)
@@ -129,20 +190,26 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) map[blobTypeKin
 	}()
 
 	for result := range results {
-		output := result.output
-		classification := result.classification
-		status := byKind[classification.kind]
-		if status == nil {
-			status = &blobTypeStatus{
-				kind: classification.kind,
-			}
-			byKind[classification.kind] = status
+		kind := result.classification.kind
+		addBlobType(byKind, kind, result.output)
+		if kind != blobTypeUnreadable {
+			classified[result.output.outputID] = kind
 		}
-		status.count++
-		status.size += output.size
-		status.compressedSize += output.compressedSize
 	}
-	return byKind
+	return byKind, classified
+}
+
+func addBlobType(byKind map[blobTypeKind]*blobTypeStatus, kind blobTypeKind, output catalogOutput) {
+	status := byKind[kind]
+	if status == nil {
+		status = &blobTypeStatus{
+			kind: kind,
+		}
+		byKind[kind] = status
+	}
+	status.count++
+	status.size += output.size
+	status.compressedSize += output.compressedSize
 }
 
 func classifyCompressedBlob(path string, decoder *zstd.Decoder) (blobClassification, *zstd.Decoder) {

@@ -25,6 +25,7 @@ type catalogOutput struct {
 	outputID       string
 	size           int64
 	compressedSize int64
+	blobType       sql.NullInt64
 }
 
 func newCatalog(db catalogDB) *catalog {
@@ -90,7 +91,8 @@ ON CONFLICT(action_id) DO UPDATE SET
 	size = excluded.size,
 	compressed_size = excluded.compressed_size,
 	created_at = excluded.created_at,
-	accessed_at = excluded.accessed_at`,
+	accessed_at = excluded.accessed_at,
+	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END`,
 		ent.ActionID,
 		ent.OutputID,
 		ent.Size,
@@ -172,11 +174,19 @@ FROM (
 	return size, err
 }
 
-func (c *catalog) listOutputs(ctx context.Context) ([]catalogOutput, error) {
-	rows, err := c.db.QueryContext(ctx, `
-SELECT output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)
-FROM entries
-GROUP BY output_id`)
+// listOutputs returns one row per output with its uncompressed and compressed
+// size. When includeBlobType is set it also returns the cached blob
+// classification (blobType), but only for entries classified at
+// classifierVersion; classifications from older versions are treated as absent
+// so they get recomputed. blobType is only available on migrated caches.
+func (c *catalog) listOutputs(ctx context.Context, includeBlobType bool, classifierVersion int64) ([]catalogOutput, error) {
+	columns := "output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)"
+	args := []any(nil)
+	if includeBlobType {
+		columns += ", MAX(CASE WHEN blob_type_version = ? THEN blob_type END)"
+		args = append(args, classifierVersion)
+	}
+	rows, err := c.db.QueryContext(ctx, "SELECT "+columns+" FROM entries GROUP BY output_id", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +195,11 @@ GROUP BY output_id`)
 	var outputs []catalogOutput
 	for rows.Next() {
 		var output catalogOutput
-		if err := rows.Scan(&output.outputID, &output.size, &output.compressedSize); err != nil {
+		dest := []any{&output.outputID, &output.size, &output.compressedSize}
+		if includeBlobType {
+			dest = append(dest, &output.blobType)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		outputs = append(outputs, output)
@@ -194,6 +208,33 @@ GROUP BY output_id`)
 		return nil, err
 	}
 	return outputs, nil
+}
+
+func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
+	_, err := c.db.ExecContext(ctx, `
+UPDATE entries
+SET blob_type = ?, blob_type_version = ?
+WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
+	return err
+}
+
+func entriesHasColumn(ctx context.Context, db catalogDB, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info('entries')`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {

@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS entries (
 	size INTEGER NOT NULL,
 	compressed_size INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
-	accessed_at INTEGER NOT NULL
+	accessed_at INTEGER NOT NULL,
+	blob_type INTEGER,
+	blob_type_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS entries_output_id ON entries(output_id);
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
@@ -225,8 +227,32 @@ func initDB(db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, catalogSchema); err != nil {
 		return fmt.Errorf("initialize catalog: %w", err)
 	}
+	if err := migrateSchema(ctx, db); err != nil {
+		return err
+	}
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, cacheSchemaVersion)); err != nil {
 		return fmt.Errorf("write catalog version: %w", err)
+	}
+	return nil
+}
+
+// migrateSchema applies in-place schema changes to caches created by earlier
+// versions of gocachez without bumping cacheSchemaVersion, so existing caches
+// keep working after an upgrade.
+func migrateSchema(ctx context.Context, db catalogDB) error {
+	for _, col := range []struct{ name, ddl string }{
+		{"blob_type", "blob_type INTEGER"},
+		{"blob_type_version", "blob_type_version INTEGER"},
+	} {
+		has, err := entriesHasColumn(ctx, db, col.name)
+		if err != nil {
+			return fmt.Errorf("inspect entries schema: %w", err)
+		}
+		if !has {
+			if _, err := db.ExecContext(ctx, "ALTER TABLE entries ADD COLUMN "+col.ddl); err != nil {
+				return fmt.Errorf("add entries.%s column: %w", col.name, err)
+			}
+		}
 	}
 	return nil
 }

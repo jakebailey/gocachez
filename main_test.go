@@ -1940,6 +1940,231 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 	assertContains(t, got, "Unreadable blobs      1        4B")
 }
 
+func TestStatusCachesBlobTypes(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	outputID := bytes.Repeat([]byte{90}, 32)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{89}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(archive)),
+	}, bufio.NewReader(encodedBody(archive))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	versionDir, blobsDir, _, _ := cachePaths(config{dir: cacheDir})
+	dbPath := filepath.Join(versionDir, "cache.db")
+
+	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBlobKind(t, statuses, blobTypeGoPackageArchive, 1)
+
+	// Removing the blob forces the second pass to rely on the cached
+	// classification; if it decompressed it would report the blob unreadable.
+	if err := os.Remove(blobPath(blobsDir, hexOf(outputID))); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = readBlobTypeStatus(dbPath, blobsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBlobKind(t, statuses, blobTypeGoPackageArchive, 1)
+}
+
+func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 64))
+	outputID := bytes.Repeat([]byte{92}, 32)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{91}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(archive)),
+	}, bufio.NewReader(encodedBody(archive))); err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	versionDir, blobsDir, _, _ := cachePaths(config{dir: cacheDir})
+	dbPath := filepath.Join(versionDir, "cache.db")
+
+	// Seed a wrong classification recorded under a different classifier version.
+	execCatalog(t, dbPath, `UPDATE entries SET blob_type = ?, blob_type_version = ?`,
+		int64(blobTypeText), int64(blobClassifierVersion+1))
+
+	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBlobKind(t, statuses, blobTypeGoPackageArchive, 1)
+
+	// The stale value is recomputed and re-stored at the current version.
+	var kind, version sql.NullInt64
+	queryCatalog(t, dbPath, `SELECT blob_type, blob_type_version FROM entries WHERE output_id = ?`,
+		[]any{hexOf(outputID)}, &kind, &version)
+	if !kind.Valid || blobTypeKind(kind.Int64) != blobTypeGoPackageArchive {
+		t.Fatalf("cached blob_type = %v, want %d", kind, blobTypeGoPackageArchive)
+	}
+	if !version.Valid || version.Int64 != int64(blobClassifierVersion) {
+		t.Fatalf("cached blob_type_version = %v, want %d", version, blobClassifierVersion)
+	}
+}
+
+func TestUpsertEntryInvalidatesBlobTypeOnOutputChange(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	ctx := context.Background()
+	actionID := hexOf(bytes.Repeat([]byte{1}, 32))
+	output1 := hexOf(bytes.Repeat([]byte{2}, 32))
+	output2 := hexOf(bytes.Repeat([]byte{3}, 32))
+	now := time.Now()
+	base := entry{ActionID: actionID, OutputID: output1, Size: 1, CompressedSize: 1, CreatedAt: now, AccessedAt: now}
+
+	if err := st.q.upsertEntry(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.updateBlobType(ctx, output1, blobTypeGoPackageArchive, blobClassifierVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-putting the action with a different output must drop the stale type.
+	changed := base
+	changed.OutputID = output2
+	if err := st.q.upsertEntry(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	var blobType sql.NullInt64
+	if err := st.db.QueryRowContext(ctx, `SELECT blob_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType); err != nil {
+		t.Fatal(err)
+	}
+	if blobType.Valid {
+		t.Fatalf("blob_type = %d after output change, want NULL", blobType.Int64)
+	}
+
+	// Re-putting with the same output preserves the cached type.
+	if err := st.q.updateBlobType(ctx, output2, blobTypeGoSource, blobClassifierVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.upsertEntry(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT blob_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType); err != nil {
+		t.Fatal(err)
+	}
+	if !blobType.Valid || blobTypeKind(blobType.Int64) != blobTypeGoSource {
+		t.Fatalf("blob_type = %v after same-output re-put, want %d", blobType, blobTypeGoSource)
+	}
+}
+
+func TestMigrateSchemaAddsBlobTypeColumns(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE entries (
+	action_id TEXT PRIMARY KEY,
+	output_id TEXT NOT NULL,
+	size INTEGER NOT NULL,
+	compressed_size INTEGER NOT NULL,
+	created_at INTEGER NOT NULL,
+	accessed_at INTEGER NOT NULL
+)`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, col := range []string{"blob_type", "blob_type_version"} {
+		if has, err := entriesHasColumn(ctx, db, col); err != nil {
+			t.Fatal(err)
+		} else if has {
+			t.Fatalf("column %s present before migration", col)
+		}
+	}
+
+	if err := migrateSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent: running again must not fail.
+	if err := migrateSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, col := range []string{"blob_type", "blob_type_version"} {
+		if has, err := entriesHasColumn(ctx, db, col); err != nil {
+			t.Fatal(err)
+		} else if !has {
+			t.Fatalf("column %s missing after migration", col)
+		}
+	}
+}
+
+func assertBlobKind(t *testing.T, statuses []blobTypeStatus, kind blobTypeKind, count int64) {
+	t.Helper()
+	for _, status := range statuses {
+		if status.kind == kind {
+			if status.count != count {
+				t.Fatalf("kind %s count = %d, want %d", kind.label(), status.count, count)
+			}
+			return
+		}
+	}
+	t.Fatalf("kind %s not found in statuses", kind.label())
+}
+
+func execCatalog(t *testing.T, dbPath, query string, args ...any) {
+	t.Helper()
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func queryCatalog(t *testing.T, dbPath, query string, args []any, dest ...any) {
+	t.Helper()
+	db, err := openExistingDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(dest...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunReportsInitialWriteError(t *testing.T) {
 	t.Parallel()
 
