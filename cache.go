@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"github.com/klauspost/compress/zstd"
+	"zombiezen.com/go/sqlite"
 )
 
 var errInvalidCacheEntry = errors.New("invalid cache entry")
@@ -144,8 +144,8 @@ func (st *store) get(req request) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
-	ent, err := st.lookupEntry(actionHex)
-	if errors.Is(err, sql.ErrNoRows) {
+	ent, found, err := st.lookupEntry(actionHex)
+	if !found && err == nil {
 		return response{ID: req.ID, Miss: true}, nil
 	}
 	if err != nil {
@@ -216,18 +216,9 @@ func (st *store) flushAccessTimes() error {
 	}
 
 	ctx := context.Background()
-	tx, err := st.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin access-time transaction: %w", err)
-	}
-	if err := st.q.touchEntries(ctx, tx, accessed); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit access-time transaction: %w", err)
-	}
-	return nil
+	return st.db.withTx(ctx, func(conn *sqlite.Conn) error {
+		return touchEntries(conn, accessed)
+	})
 }
 
 func (st *store) materialize(ent entry) (string, error) {
@@ -339,7 +330,7 @@ func (st *store) upsertEntry(ent entry) error {
 	return nil
 }
 
-func (st *store) lookupEntry(actionID string) (entry, error) {
+func (st *store) lookupEntry(actionID string) (entry, bool, error) {
 	return st.q.lookupEntry(context.Background(), actionID)
 }
 

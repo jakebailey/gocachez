@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
+	"zombiezen.com/go/sqlite"
 )
 
 const blobTypePrefixLimit = 64 << 10
@@ -103,18 +104,14 @@ func persistBlobTypes(dbPath string, classified map[string]blobTypeKind) error {
 	defer db.Close() //nolint:errcheck
 
 	ctx := context.Background()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	qtx := newCatalog(db).withTx(tx)
-	for outputID, kind := range classified {
-		if err := qtx.updateBlobType(ctx, outputID, kind, blobClassifierVersion); err != nil {
-			_ = tx.Rollback()
-			return err
+	return db.withTx(ctx, func(conn *sqlite.Conn) error {
+		for outputID, kind := range classified {
+			if err := updateBlobType(conn, outputID, kind, blobClassifierVersion); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 type blobTypeResult struct {
@@ -132,8 +129,8 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKi
 
 	var pending []catalogOutput
 	for _, output := range outputs {
-		if output.blobType.Valid {
-			addBlobType(byKind, blobTypeKind(output.blobType.Int64), output)
+		if output.blobType.ok {
+			addBlobType(byKind, blobTypeKind(output.blobType.value), output)
 			continue
 		}
 		pending = append(pending, output)

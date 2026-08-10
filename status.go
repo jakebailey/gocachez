@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,8 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 type cacheStatus struct {
@@ -174,30 +175,45 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 	defer db.Close() //nolint:errcheck
 
-	ctx := context.Background()
 	var status catalogStatus
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM entries`).Scan(&status.entries); err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("count catalog entries: %w", err)
-	}
-	var oldestAccessedAt sql.NullInt64
-	if err := db.QueryRowContext(ctx, `SELECT MIN(accessed_at) FROM entries`).Scan(&oldestAccessedAt); err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("find oldest catalog access: %w", err)
-	}
-	if oldestAccessedAt.Valid {
-		status.oldestAccessedAt = millisTime(oldestAccessedAt.Int64)
-		status.hasOldestAccessed = true
+	err = db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		var err error
+		status.entries, err = queryInt64(conn, `SELECT COUNT(*) FROM entries`, nil)
+		if err != nil {
+			return fmt.Errorf("count catalog entries: %w", err)
+		}
+		if err := sqlitex.Execute(conn, `SELECT MIN(accessed_at) FROM entries`, &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				if !stmt.ColumnIsNull(0) {
+					status.oldestAccessedAt = millisTime(stmt.ColumnInt64(0))
+					status.hasOldestAccessed = true
+				}
+				return nil
+			},
+		}); err != nil {
+			return fmt.Errorf("find oldest catalog access: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, catalogStatus{}, nil, err
 	}
 
 	q := newCatalog(db)
-	hasBlobType, err := entriesHasColumn(ctx, db, "blob_type_version")
+	var hasBlobType, hasRetainedType bool
+	err = db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		var err error
+		hasBlobType, err = entriesHasColumn(conn, "blob_type_version")
+		if err != nil {
+			return err
+		}
+		hasRetainedType, err = entriesHasColumn(conn, "retained_type_version")
+		return err
+	})
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
 	}
-	hasRetainedType, err := entriesHasColumn(ctx, db, "retained_type_version")
-	if err != nil {
-		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
-	}
-	outputs, err := q.listOutputs(ctx, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
+	outputs, err := q.listOutputs(context.Background(), hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
@@ -207,7 +223,7 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 	status.outputs = int64(len(outputs))
 
-	status.runs, err = q.countRuns(ctx)
+	status.runs, err = q.countRuns(context.Background())
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("count catalog runs: %w", err)
 	}
@@ -424,8 +440,8 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
 	cached := make(map[string]retainedTypeKind)
 	for _, output := range outputs {
-		if output.retainedType.Valid {
-			cached[output.outputID] = retainedTypeKind(output.retainedType.Int64)
+		if output.retainedType.ok {
+			cached[output.outputID] = retainedTypeKind(output.retainedType.value)
 		}
 	}
 	classified := make(map[string]retainedTypeKind)
@@ -495,18 +511,14 @@ func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind)
 	defer db.Close() //nolint:errcheck
 
 	ctx := context.Background()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	qtx := newCatalog(db).withTx(tx)
-	for outputID, kind := range classified {
-		if err := qtx.updateRetainedType(ctx, outputID, kind); err != nil {
-			_ = tx.Rollback()
-			return err
+	return db.withTx(ctx, func(conn *sqlite.Conn) error {
+		for outputID, kind := range classified {
+			if err := updateRetainedType(conn, outputID, kind); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func retainedFileKind(path string) retainedTypeKind {

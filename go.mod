@@ -7,7 +7,7 @@ require (
 	github.com/klauspost/compress v1.19.0
 	golang.org/x/term v0.44.0
 	golang.org/x/tools v0.47.0
-	modernc.org/sqlite v1.53.0
+	zombiezen.com/go/sqlite v1.4.2
 )
 
 require (
@@ -20,4 +20,5 @@ require (
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.53.0 // indirect
 )

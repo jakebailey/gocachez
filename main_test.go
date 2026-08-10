@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +19,8 @@ import (
 
 	"github.com/gofrs/flock"
 	"golang.org/x/tools/go/gcexportdata"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 func TestStorePutGet(t *testing.T) {
@@ -470,17 +471,12 @@ func TestVersionedLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	var version int
-	ctx := context.Background()
-	if err := st.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
+	queryDB(t, st.db, `PRAGMA user_version`, nil, &version)
 	if version != cacheSchemaVersion {
 		t.Fatalf("user_version = %d, want %d", version, cacheSchemaVersion)
 	}
 	var synchronous int
-	if err := st.db.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&synchronous); err != nil {
-		t.Fatal(err)
-	}
+	queryDB(t, st.db, `PRAGMA synchronous`, nil, &synchronous)
 	if synchronous != 1 {
 		t.Fatalf("synchronous = %d, want 1 (NORMAL)", synchronous)
 	}
@@ -494,9 +490,7 @@ func TestRejectsMismatchedDBVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(context.Background(), `PRAGMA user_version = 999`); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, db, `PRAGMA user_version = 999`)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -778,9 +772,7 @@ func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -832,9 +824,7 @@ func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1026,8 +1016,8 @@ func TestPruneKeepsLiveBlobs(t *testing.T) {
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
-		t.Fatalf("live entry was pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || !found {
+		t.Fatalf("live entry was pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
 		t.Fatalf("live blob was pruned: %v", err)
@@ -1148,8 +1138,8 @@ func TestPruneRemovesUnusedBlobs(t *testing.T) {
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("entry was not pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || found {
+		t.Fatalf("entry was not pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("blob was not pruned: %v", err)
@@ -1177,9 +1167,7 @@ func TestPruneRemovesOrphanBlobsWithSizePruningDisabled(t *testing.T) {
 	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -1251,30 +1239,21 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	}
 
 	recent := unixMillis(time.Now())
-	if _, err := st.db.ExecContext(
-		context.Background(),
+	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-3000,
 		hexOf(oldSharedActionID),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(
-		context.Background(),
+	)
+	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-1000,
 		hexOf(newSharedActionID),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(
-		context.Background(),
+	)
+	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-2000,
 		hexOf(prunedActionID),
-	); err != nil {
-		t.Fatal(err)
-	}
+	)
 
 	total, err := st.compressedSize()
 	if err != nil {
@@ -1285,21 +1264,19 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.maxSize = total - prunedInfo.Size()
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := st.lookupEntry(hexOf(prunedActionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("middle-aged blob was not pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(prunedActionID)); err != nil || found {
+		t.Fatalf("middle-aged blob was not pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := st.lookupEntry(hexOf(oldSharedActionID)); err != nil {
-		t.Fatalf("shared output old action was pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(oldSharedActionID)); err != nil || !found {
+		t.Fatalf("shared output old action was pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := st.lookupEntry(hexOf(newSharedActionID)); err != nil {
-		t.Fatalf("shared output new action was pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(newSharedActionID)); err != nil || !found {
+		t.Fatalf("shared output new action was pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned: %v", err)
@@ -1350,40 +1327,35 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 
 	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
 	for _, actionID := range [][]byte{oldActionID, oldSharedActionID} {
-		if _, err := st.db.ExecContext(
-			context.Background(),
+		execDB(t, st.db,
 			`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 			stale,
 			hexOf(actionID),
-		); err != nil {
-			t.Fatal(err)
-		}
+		)
 	}
 
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := st.lookupEntry(hexOf(oldActionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("stale entry was not pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(oldActionID)); err != nil || found {
+		t.Fatalf("stale entry was not pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(oldOutputID))); !os.IsNotExist(err) {
 		t.Fatalf("stale entry blob stat err = %v, want not exist", err)
 	}
-	if _, err := st.lookupEntry(hexOf(freshActionID)); err != nil {
-		t.Fatalf("fresh entry was pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(freshActionID)); err != nil || !found {
+		t.Fatalf("fresh entry was pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(freshOutputID))); err != nil {
 		t.Fatalf("fresh entry blob was pruned: %v", err)
 	}
-	if _, err := st.lookupEntry(hexOf(oldSharedActionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("stale shared action was not pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(oldSharedActionID)); err != nil || found {
+		t.Fatalf("stale shared action was not pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := st.lookupEntry(hexOf(freshSharedActionID)); err != nil {
-		t.Fatalf("fresh shared action was pruned: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(freshSharedActionID)); err != nil || !found {
+		t.Fatalf("fresh shared action was pruned: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned while still referenced: %v", err)
@@ -1416,23 +1388,18 @@ func TestPruneKeepsOldEntriesWhenMaxAgeDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := st.db.ExecContext(
-		context.Background(),
+	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		int64(1000),
 		hexOf(actionID),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.db.ExecContext(context.Background(), `DELETE FROM runs WHERE run_id = ?`, st.runID); err != nil {
-		t.Fatal(err)
-	}
+	)
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
-		t.Fatalf("entry pruned with age-based pruning disabled: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || !found {
+		t.Fatalf("entry pruned with age-based pruning disabled: found=%t, err=%v", found, err)
 	}
 }
 
@@ -1460,14 +1427,11 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	actionHex := hexOf(actionID)
-	if _, err := st.db.ExecContext(
-		context.Background(),
+	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		int64(1000),
 		actionHex,
-	); err != nil {
-		t.Fatal(err)
-	}
+	)
 	if _, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID}); err != nil {
 		t.Fatal(err)
 	}
@@ -1475,13 +1439,11 @@ func TestAccessTimesFlushOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	var accessedAt int64
-	if err := st.db.QueryRowContext(
-		context.Background(),
+	queryDB(t, st.db,
 		`SELECT accessed_at FROM entries WHERE action_id = ?`,
-		actionHex,
-	).Scan(&accessedAt); err != nil {
-		t.Fatal(err)
-	}
+		[]any{actionHex},
+		&accessedAt,
+	)
 	if accessedAt <= 1000 {
 		t.Fatalf("accessed_at = %d, want > 1000", accessedAt)
 	}
@@ -1741,8 +1703,8 @@ func TestRunCleanKeepsActiveState(t *testing.T) {
 	if _, err := os.Stat(res.DiskPath); err != nil {
 		t.Fatalf("active live file was removed: %v", err)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); err != nil {
-		t.Fatalf("active entry was removed: %v", err)
+	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || !found {
+		t.Fatalf("active entry was removed: found=%t, err=%v", found, err)
 	}
 }
 
@@ -2129,13 +2091,13 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	assertBlobKind(t, statuses, blobTypeGoPackageArchive, 1)
 
 	// The stale value is recomputed and re-stored at the current version.
-	var kind, version sql.NullInt64
+	var kind, version optionalInt64
 	queryCatalog(t, dbPath, `SELECT blob_type, blob_type_version FROM entries WHERE output_id = ?`,
 		[]any{hexOf(outputID)}, &kind, &version)
-	if !kind.Valid || blobTypeKind(kind.Int64) != blobTypeGoPackageArchive {
+	if !kind.ok || blobTypeKind(kind.value) != blobTypeGoPackageArchive {
 		t.Fatalf("cached blob_type = %v, want %d", kind, blobTypeGoPackageArchive)
 	}
-	if !version.Valid || version.Int64 != int64(blobClassifierVersion) {
+	if !version.ok || version.value != int64(blobClassifierVersion) {
 		t.Fatalf("cached blob_type_version = %v, want %d", version, blobClassifierVersion)
 	}
 }
@@ -2166,13 +2128,13 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 	outputHex := hexOf(outputID)
 
 	// New retained files are classified when they are created.
-	var kind, version sql.NullInt64
+	var kind, version optionalInt64
 	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
 		[]any{outputHex}, &kind, &version)
-	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
+	if !kind.ok || retainedTypeKind(kind.value) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("cached retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
 	}
-	if !version.Valid || version.Int64 != int64(retainedClassifierVersion) {
+	if !version.ok || version.value != int64(retainedClassifierVersion) {
 		t.Fatalf("cached retained_type_version = %v, want %d", version, retainedClassifierVersion)
 	}
 
@@ -2190,10 +2152,10 @@ func TestStatusCachesRetainedTypes(t *testing.T) {
 
 	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
 		[]any{outputHex}, &kind, &version)
-	if !kind.Valid || retainedTypeKind(kind.Int64) != retainedTypeGeneratedCgoSource {
+	if !kind.ok || retainedTypeKind(kind.value) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("backfilled retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
 	}
-	if !version.Valid || version.Int64 != int64(retainedClassifierVersion) {
+	if !version.ok || version.value != int64(retainedClassifierVersion) {
 		t.Fatalf("backfilled retained_type_version = %v, want %d", version, retainedClassifierVersion)
 	}
 
@@ -2245,15 +2207,13 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	if err := st.q.upsertEntry(ctx, changed); err != nil {
 		t.Fatal(err)
 	}
-	var blobType, retainedType sql.NullInt64
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType, &retainedType); err != nil {
-		t.Fatal(err)
+	var blobType, retainedType optionalInt64
+	queryDB(t, st.db, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType, &retainedType)
+	if blobType.ok {
+		t.Fatalf("blob_type = %d after output change, want NULL", blobType.value)
 	}
-	if blobType.Valid {
-		t.Fatalf("blob_type = %d after output change, want NULL", blobType.Int64)
-	}
-	if retainedType.Valid {
-		t.Fatalf("retained_type = %d after output change, want NULL", retainedType.Int64)
+	if retainedType.ok {
+		t.Fatalf("retained_type = %d after output change, want NULL", retainedType.value)
 	}
 
 	// Re-putting with the same output preserves cached classifications.
@@ -2266,13 +2226,11 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	if err := st.q.upsertEntry(ctx, changed); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.db.QueryRowContext(ctx, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, actionID).Scan(&blobType, &retainedType); err != nil {
-		t.Fatal(err)
-	}
-	if !blobType.Valid || blobTypeKind(blobType.Int64) != blobTypeGoSource {
+	queryDB(t, st.db, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType, &retainedType)
+	if !blobType.ok || blobTypeKind(blobType.value) != blobTypeGoSource {
 		t.Fatalf("blob_type = %v after same-output re-put, want %d", blobType, blobTypeGoSource)
 	}
-	if !retainedType.Valid || retainedTypeKind(retainedType.Int64) != retainedTypeGeneratedCgoSource {
+	if !retainedType.ok || retainedTypeKind(retainedType.value) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("retained_type = %v after same-output re-put, want %d", retainedType, retainedTypeGeneratedCgoSource)
 	}
 }
@@ -2281,14 +2239,13 @@ func TestMigrateSchemaAddsClassificationColumns(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "cache.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	conn, err := sqlite.OpenConn(dbPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close() //nolint:errcheck
+	defer conn.Close() //nolint:errcheck
 
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `
+	if err := sqlitex.ExecuteScript(conn, `
 CREATE TABLE entries (
 	action_id TEXT PRIMARY KEY,
 	output_id TEXT NOT NULL,
@@ -2297,28 +2254,28 @@ CREATE TABLE entries (
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL
 );
-CREATE INDEX entries_output_id ON entries(output_id)`); err != nil {
+CREATE INDEX entries_output_id ON entries(output_id)`, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
-		if has, err := entriesHasColumn(ctx, db, col); err != nil {
+		if has, err := entriesHasColumn(conn, col); err != nil {
 			t.Fatal(err)
 		} else if has {
 			t.Fatalf("column %s present before migration", col)
 		}
 	}
 
-	if err := migrateSchema(ctx, db); err != nil {
+	if err := migrateSchema(conn); err != nil {
 		t.Fatal(err)
 	}
 	// Idempotent: running again must not fail.
-	if err := migrateSchema(ctx, db); err != nil {
+	if err := migrateSchema(conn); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
-		if has, err := entriesHasColumn(ctx, db, col); err != nil {
+		if has, err := entriesHasColumn(conn, col); err != nil {
 			t.Fatal(err)
 		} else if !has {
 			t.Fatalf("column %s missing after migration", col)
@@ -2326,27 +2283,25 @@ CREATE INDEX entries_output_id ON entries(output_id)`); err != nil {
 	}
 
 	// The plain output_id index is replaced by the covering index.
-	if has, err := indexExists(ctx, db, "entries_output_cover"); err != nil {
+	if has, err := indexExists(conn, "entries_output_cover"); err != nil {
 		t.Fatal(err)
 	} else if !has {
 		t.Fatal("entries_output_cover missing after migration")
 	}
-	if current, err := statusCoverIndexCurrent(ctx, db); err != nil {
+	if current, err := statusCoverIndexCurrent(conn); err != nil {
 		t.Fatal(err)
 	} else if !current {
 		t.Fatal("entries_output_cover does not cover status classifications")
 	}
-	if has, err := indexExists(ctx, db, "entries_output_id"); err != nil {
+	if has, err := indexExists(conn, "entries_output_id"); err != nil {
 		t.Fatal(err)
 	} else if has {
 		t.Fatal("entries_output_id present after migration")
 	}
 }
 
-func indexExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
-	var count int
-	err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&count)
+func indexExists(conn *sqlite.Conn, name string) (bool, error) {
+	count, err := queryInt64(conn, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, []any{name})
 	return count > 0, err
 }
 
@@ -2383,9 +2338,7 @@ func execCatalog(t *testing.T, dbPath, query string, args ...any) {
 		t.Fatal(err)
 	}
 	defer db.Close() //nolint:errcheck
-	if _, err := db.ExecContext(context.Background(), query, args...); err != nil {
-		t.Fatal(err)
-	}
+	execDB(t, db, query, args...)
 }
 
 func queryCatalog(t *testing.T, dbPath, query string, args []any, dest ...any) {
@@ -2395,9 +2348,7 @@ func queryCatalog(t *testing.T, dbPath, query string, args []any, dest ...any) {
 		t.Fatal(err)
 	}
 	defer db.Close() //nolint:errcheck
-	if err := db.QueryRowContext(context.Background(), query, args...).Scan(dest...); err != nil {
-		t.Fatal(err)
-	}
+	queryDB(t, db, query, args, dest...)
 }
 
 func TestRunReportsInitialWriteError(t *testing.T) {
@@ -2764,8 +2715,8 @@ func TestCorruptBlobIsCacheMiss(t *testing.T) {
 	if !res.Miss {
 		t.Fatalf("get response = %+v, want miss", res)
 	}
-	if _, err := st.lookupEntry(hexOf(actionID)); !errorsIs(err, sql.ErrNoRows) {
-		t.Fatalf("entry = %v, want sql.ErrNoRows", err)
+	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || found {
+		t.Fatalf("entry remains after invalidation: found=%t, err=%v", found, err)
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("blob stat err = %v, want not exist", err)
@@ -3250,16 +3201,57 @@ func retainedPath(cacheDir string, outputID []byte, ext string) string {
 	return filepath.Join(cacheDir, "v1", retainedDirName, outputHex[:2], outputHex+ext)
 }
 
-func errorsIs(err, target error) bool {
-	return err != nil && errors.Is(err, target)
-}
-
-func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
+func execDB(t *testing.T, db *sqliteDB, query string, args ...any) {
 	t.Helper()
-	var count int
-	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&count); err != nil {
+	err := db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		return execute(conn, query, args...)
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func queryDB(t *testing.T, db *sqliteDB, query string, args []any, dest ...any) {
+	t.Helper()
+	found := false
+	err := db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		return sqlitex.Execute(conn, query, &sqlitex.ExecOptions{
+			Args: args,
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				found = true
+				for i, target := range dest {
+					switch target := target.(type) {
+					case *int:
+						*target = int(stmt.ColumnInt64(i))
+					case *int64:
+						*target = stmt.ColumnInt64(i)
+					case *string:
+						*target = stmt.ColumnText(i)
+					case *optionalInt64:
+						target.ok = !stmt.ColumnIsNull(i)
+						if target.ok {
+							target.value = stmt.ColumnInt64(i)
+						}
+					default:
+						return fmt.Errorf("unsupported query destination %T", target)
+					}
+				}
+				return nil
+			},
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("query returned no rows")
+	}
+}
+
+func countRows(t *testing.T, db *sqliteDB, query string, args ...any) int {
+	t.Helper()
+	var count int
+	queryDB(t, db, query, args, &count)
 	return count
 }
 

@@ -2,20 +2,15 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
+
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-type catalogDB interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// lookupEntrySQL and upsertEntrySQL are the per-request hot-path queries. They
-// are prepared once on the store's connection (see catalog.prepare) so modernc
-// does not re-parse them on every get/put.
+// lookupEntrySQL and upsertEntrySQL are the per-request hot-path queries.
+// sqlite.Conn caches their prepared statements independently on each pooled
+// connection.
 const lookupEntrySQL = `
 SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
 FROM entries
@@ -41,10 +36,7 @@ SET accessed_at = ?
 WHERE action_id = ?`
 
 type catalog struct {
-	db         catalogDB
-	lookupStmt *sql.Stmt
-	upsertStmt *sql.Stmt
-	touchStmt  *sql.Stmt
+	db *sqliteDB
 }
 
 type catalogRun struct {
@@ -57,153 +49,120 @@ type catalogOutput struct {
 	outputID       string
 	size           int64
 	compressedSize int64
-	blobType       sql.NullInt64
-	retainedType   sql.NullInt64
+	blobType       optionalInt64
+	retainedType   optionalInt64
 }
 
-func newCatalog(db catalogDB) *catalog {
+type optionalInt64 struct {
+	value int64
+	ok    bool
+}
+
+func newCatalog(db *sqliteDB) *catalog {
 	return &catalog{db: db}
 }
 
-// prepare caches the hot-path statements on a persistent *sql.DB connection.
-// It is a no-op for transaction-backed catalogs (from withTx), which fall back
-// to parsing per call.
-func (c *catalog) prepare(ctx context.Context) error {
-	db, ok := c.db.(*sql.DB)
-	if !ok {
-		return nil
-	}
-	var err error
-	if c.lookupStmt, err = db.PrepareContext(ctx, lookupEntrySQL); err != nil {
-		return fmt.Errorf("prepare lookup statement: %w", err)
-	}
-	if c.upsertStmt, err = db.PrepareContext(ctx, upsertEntrySQL); err != nil {
-		return fmt.Errorf("prepare upsert statement: %w", err)
-	}
-	if c.touchStmt, err = db.PrepareContext(ctx, touchEntrySQL); err != nil {
-		return fmt.Errorf("prepare touch statement: %w", err)
-	}
-	return nil
-}
-
-func (c *catalog) close() error {
-	var err error
-	for _, stmt := range []*sql.Stmt{c.lookupStmt, c.upsertStmt, c.touchStmt} {
-		if stmt != nil {
-			err = errors.Join(err, stmt.Close())
-		}
-	}
-	return err
-}
-
-func (c *catalog) withTx(tx *sql.Tx) *catalog {
-	return &catalog{db: tx}
+func (c *catalog) useConn(ctx context.Context, fn func(*sqlite.Conn) error) error {
+	return c.db.withConn(ctx, fn)
 }
 
 func (c *catalog) registerRun(ctx context.Context, runID, path, lockPath string, createdAt int64) error {
-	_, err := c.db.ExecContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return execute(conn, `
 INSERT OR REPLACE INTO runs(run_id, path, lock_path, created_at)
 VALUES (?, ?, ?, ?)`,
-		runID, path, lockPath, createdAt,
-	)
-	return err
+			runID, path, lockPath, createdAt,
+		)
+	})
 }
 
 func (c *catalog) listOtherRuns(ctx context.Context, runID string) ([]catalogRun, error) {
-	rows, err := c.db.QueryContext(ctx, `
+	var runs []catalogRun
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return sqlitex.Execute(conn, `
 SELECT run_id, path, lock_path
 FROM runs
-WHERE run_id != ?`, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	var runs []catalogRun
-	for rows.Next() {
-		var run catalogRun
-		if err := rows.Scan(&run.runID, &run.path, &run.lockPath); err != nil {
-			return nil, err
-		}
-		runs = append(runs, run)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return runs, nil
+WHERE run_id != ?`, &sqlitex.ExecOptions{
+			Args: []any{runID},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				runs = append(runs, catalogRun{
+					runID:    stmt.ColumnText(0),
+					path:     stmt.ColumnText(1),
+					lockPath: stmt.ColumnText(2),
+				})
+				return nil
+			},
+		})
+	})
+	return runs, err
 }
 
 func (c *catalog) countRuns(ctx context.Context) (int64, error) {
 	var count int64
-	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs`).Scan(&count)
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		count, err = queryInt64(conn, `SELECT COUNT(*) FROM runs`, nil)
+		return err
+	})
 	return count, err
 }
 
 func (c *catalog) deleteRun(ctx context.Context, runID string) error {
-	_, err := c.db.ExecContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return execute(conn, `
 DELETE FROM runs
 WHERE run_id = ?`, runID)
-	return err
+	})
 }
 
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
-	args := []any{
-		ent.ActionID,
-		ent.OutputID,
-		ent.Size,
-		ent.CompressedSize,
-		unixMillis(ent.CreatedAt),
-		unixMillis(ent.AccessedAt),
-	}
-	var err error
-	if c.upsertStmt != nil {
-		_, err = c.upsertStmt.ExecContext(ctx, args...)
-	} else {
-		_, err = c.db.ExecContext(ctx, upsertEntrySQL, args...)
-	}
-	return err
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return execPrepared(conn, upsertEntrySQL, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, ent.ActionID)
+			stmt.BindText(2, ent.OutputID)
+			stmt.BindInt64(3, ent.Size)
+			stmt.BindInt64(4, ent.CompressedSize)
+			stmt.BindInt64(5, unixMillis(ent.CreatedAt))
+			stmt.BindInt64(6, unixMillis(ent.AccessedAt))
+		})
+	})
 }
 
-func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, error) {
-	var row *sql.Row
-	if c.lookupStmt != nil {
-		row = c.lookupStmt.QueryRowContext(ctx, actionID)
-	} else {
-		row = c.db.QueryRowContext(ctx, lookupEntrySQL, actionID)
-	}
+func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, bool, error) {
 	var ent entry
 	var createdAt, accessedAt int64
-	err := row.Scan(
-		&ent.ActionID,
-		&ent.OutputID,
-		&ent.Size,
-		&ent.CompressedSize,
-		&createdAt,
-		&accessedAt,
-	)
+	var found bool
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		found, err = queryPrepared(conn, lookupEntrySQL, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, actionID)
+		}, func(stmt *sqlite.Stmt) {
+			ent.ActionID = stmt.ColumnText(0)
+			ent.OutputID = stmt.ColumnText(1)
+			ent.Size = stmt.ColumnInt64(2)
+			ent.CompressedSize = stmt.ColumnInt64(3)
+			createdAt = stmt.ColumnInt64(4)
+			accessedAt = stmt.ColumnInt64(5)
+		})
+		return err
+	})
 	if err != nil {
-		return entry{}, err
+		return entry{}, false, err
+	}
+	if !found {
+		return entry{}, false, nil
 	}
 	ent.CreatedAt = millisTime(createdAt)
 	ent.AccessedAt = millisTime(accessedAt)
-	return ent, nil
+	return ent, true, nil
 }
 
-// touchEntries updates the access time of many entries in a single transaction,
-// reusing the prepared statement (bound to tx) so the update is parsed once.
-func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[string]int64) error {
-	if c.touchStmt == nil {
-		for actionID, accessedAt := range accessed {
-			if _, err := tx.ExecContext(ctx, touchEntrySQL, accessedAt, actionID); err != nil {
-				return fmt.Errorf("touch entry: %w", err)
-			}
-		}
-		return nil
-	}
-	stmt := tx.StmtContext(ctx, c.touchStmt)
-	defer stmt.Close() //nolint:errcheck
+func touchEntries(conn *sqlite.Conn, accessed map[string]int64) error {
 	for actionID, accessedAt := range accessed {
-		if _, err := stmt.ExecContext(ctx, accessedAt, actionID); err != nil {
+		if err := execPrepared(conn, touchEntrySQL, func(stmt *sqlite.Stmt) {
+			stmt.BindInt64(1, accessedAt)
+			stmt.BindText(2, actionID)
+		}); err != nil {
 			return fmt.Errorf("touch entry: %w", err)
 		}
 	}
@@ -211,31 +170,40 @@ func (c *catalog) touchEntries(ctx context.Context, tx *sql.Tx, accessed map[str
 }
 
 func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
-	_, err := c.db.ExecContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return execute(conn, `
 DELETE FROM entries
 WHERE output_id = ?`, outputID)
-	return err
+	})
 }
 
 func (c *catalog) deleteEntriesAccessedBefore(ctx context.Context, cutoff int64) (int64, error) {
-	res, err := c.db.ExecContext(ctx, `
+	var removed int64
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		if err := execute(conn, `
 DELETE FROM entries
-WHERE accessed_at < ?`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+WHERE accessed_at < ?`, cutoff); err != nil {
+			return err
+		}
+		removed = int64(conn.Changes())
+		return nil
+	})
+	return removed, err
 }
 
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
 	var size int64
-	err := c.db.QueryRowContext(ctx, `
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		size, err = queryInt64(conn, `
 SELECT CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
 FROM (
 	SELECT output_id, MAX(compressed_size) AS compressed_size
 	FROM entries
 	GROUP BY output_id
-)`).Scan(&size)
+)`, nil)
+		return err
+	})
 	return size, err
 }
 
@@ -261,110 +229,105 @@ func (c *catalog) listOutputs(
 		columns += ", MAX(CASE WHEN retained_type_version = ? THEN retained_type END)"
 		args = append(args, retainedClassifierVersion)
 	}
-	rows, err := c.db.QueryContext(ctx, "SELECT "+columns+" FROM entries GROUP BY output_id", args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close() //nolint:errcheck
-
 	var outputs []catalogOutput
-	for rows.Next() {
-		var output catalogOutput
-		dest := []any{&output.outputID, &output.size, &output.compressedSize}
-		if includeBlobType {
-			dest = append(dest, &output.blobType)
-		}
-		if includeRetainedType {
-			dest = append(dest, &output.retainedType)
-		}
-		if err := rows.Scan(dest...); err != nil {
-			return nil, err
-		}
-		outputs = append(outputs, output)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return outputs, nil
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return sqlitex.Execute(conn, "SELECT "+columns+" FROM entries GROUP BY output_id", &sqlitex.ExecOptions{
+			Args: args,
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				output := catalogOutput{
+					outputID:       stmt.ColumnText(0),
+					size:           stmt.ColumnInt64(1),
+					compressedSize: stmt.ColumnInt64(2),
+				}
+				column := 3
+				if includeBlobType {
+					if !stmt.ColumnIsNull(column) {
+						output.blobType = optionalInt64{value: stmt.ColumnInt64(column), ok: true}
+					}
+					column++
+				}
+				if includeRetainedType && !stmt.ColumnIsNull(column) {
+					output.retainedType = optionalInt64{value: stmt.ColumnInt64(column), ok: true}
+				}
+				outputs = append(outputs, output)
+				return nil
+			},
+		})
+	})
+	return outputs, err
 }
 
 func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, outputIDs map[string]struct{}) error {
-	rows, err := c.db.QueryContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		clear(outputIDs)
+		return sqlitex.Execute(conn, `
 SELECT DISTINCT output_id
 FROM entries
-WHERE output_id >= ? AND output_id < ?`, lower, upper)
-	if err != nil {
-		return err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	clear(outputIDs)
-	for rows.Next() {
-		var outputID string
-		if err := rows.Scan(&outputID); err != nil {
-			return err
-		}
-		outputIDs[outputID] = struct{}{}
-	}
-	return rows.Err()
+WHERE output_id >= ? AND output_id < ?`, &sqlitex.ExecOptions{
+			Args: []any{lower, upper},
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				outputIDs[stmt.ColumnText(0)] = struct{}{}
+				return nil
+			},
+		})
+	})
 }
 
 func (c *catalog) updateBlobType(ctx context.Context, outputID string, kind blobTypeKind, classifierVersion int64) error {
-	_, err := c.db.ExecContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return updateBlobType(conn, outputID, kind, classifierVersion)
+	})
+}
+
+func updateBlobType(conn *sqlite.Conn, outputID string, kind blobTypeKind, classifierVersion int64) error {
+	return execute(conn, `
 UPDATE entries
 SET blob_type = ?, blob_type_version = ?
 WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
-	return err
 }
 
 func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind) error {
-	_, err := c.db.ExecContext(ctx, `
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return updateRetainedType(conn, outputID, kind)
+	})
+}
+
+func updateRetainedType(conn *sqlite.Conn, outputID string, kind retainedTypeKind) error {
+	return execute(conn, `
 UPDATE entries
 SET retained_type = ?, retained_type_version = ?
 WHERE output_id = ?`, int64(kind), retainedClassifierVersion, outputID)
-	return err
 }
 
-func entriesHasColumn(ctx context.Context, db catalogDB, column string) (bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info('entries')`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return false, err
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
+func entriesHasColumn(conn *sqlite.Conn, column string) (bool, error) {
+	found := false
+	err := sqlitex.Execute(conn, `SELECT name FROM pragma_table_info('entries')`, &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			if stmt.ColumnText(0) == column {
+				found = true
+			}
+			return nil
+		},
+	})
+	return found, err
 }
 
 func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {
-	rows, err := c.db.QueryContext(ctx, `
+	var candidates []pruneCandidate
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return sqlitex.Execute(conn, `
 SELECT e.output_id, CAST(MAX(e.compressed_size) AS INTEGER)
 FROM entries AS e
 GROUP BY e.output_id
-ORDER BY MAX(e.accessed_at)`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close() //nolint:errcheck
-
-	var candidates []pruneCandidate
-	for rows.Next() {
-		var candidate pruneCandidate
-		if err := rows.Scan(&candidate.outputID, &candidate.size); err != nil {
-			return nil, err
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return candidates, nil
+ORDER BY MAX(e.accessed_at)`, &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				candidates = append(candidates, pruneCandidate{
+					outputID: stmt.ColumnText(0),
+					size:     stmt.ColumnInt64(1),
+				})
+				return nil
+			},
+		})
+	})
+	return candidates, err
 }

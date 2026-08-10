@@ -2,21 +2,19 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
-	_ "modernc.org/sqlite"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 const cacheSchemaVersion = 1
@@ -56,7 +54,7 @@ type entry struct {
 type store struct {
 	config
 
-	db                *sql.DB
+	db                *sqliteDB
 	q                 *catalog
 	versionDir        string
 	blobsDir          string
@@ -151,16 +149,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
 	}
-	if err := st.q.prepare(context.Background()); err != nil {
-		_ = st.q.close()
-		_ = db.Close()
-		_ = runLock.Unlock()
-		_ = runLock.Close()
-		_ = os.RemoveAll(runDir)
-		return nil, err
-	}
 	if err := st.registerRun(); err != nil {
-		_ = st.q.close()
 		_ = db.Close()
 		_ = runLock.Unlock()
 		_ = runLock.Close()
@@ -192,112 +181,69 @@ func withFileLock(path string, fn func() error) error {
 	return err
 }
 
-func openDB(path string) (*sql.DB, error) {
-	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open catalog: %w", err)
-	}
-	conns := min(max(runtime.GOMAXPROCS(0), 1), 8)
-	db.SetMaxOpenConns(conns)
-	db.SetMaxIdleConns(conns)
-	if err := initDB(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
-func openExistingDB(path string) (*sql.DB, error) {
-	dsn := "file:" + url.PathEscape(filepath.ToSlash(path)) + "?mode=ro&_pragma=busy_timeout(5000)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open catalog: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	ctx := context.Background()
-	var version int
-	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("read catalog version: %w", err)
-	}
-	if version != cacheSchemaVersion {
-		_ = db.Close()
-		return nil, fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
-	}
-	return db, nil
-}
-
-func initDB(db *sql.DB) error {
-	ctx := context.Background()
-	var version int
-	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		return fmt.Errorf("read catalog version: %w", err)
-	}
-	if version != 0 && version != cacheSchemaVersion {
-		return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
-	}
-	if _, err := db.ExecContext(ctx, catalogSchema); err != nil {
-		return fmt.Errorf("initialize catalog: %w", err)
-	}
-	if err := migrateSchema(ctx, db); err != nil {
-		return err
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, cacheSchemaVersion)); err != nil {
-		return fmt.Errorf("write catalog version: %w", err)
-	}
-	return nil
+func initDB(db *sqliteDB) error {
+	return db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		version, err := queryInt64(conn, `PRAGMA user_version`, nil)
+		if err != nil {
+			return fmt.Errorf("read catalog version: %w", err)
+		}
+		if version != 0 && version != cacheSchemaVersion {
+			return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
+		}
+		if err := sqlitex.ExecuteScript(conn, catalogSchema, nil); err != nil {
+			return fmt.Errorf("initialize catalog: %w", err)
+		}
+		if err := migrateSchema(conn); err != nil {
+			return err
+		}
+		if err := execute(conn, fmt.Sprintf(`PRAGMA user_version = %d`, cacheSchemaVersion)); err != nil {
+			return fmt.Errorf("write catalog version: %w", err)
+		}
+		return nil
+	})
 }
 
 // migrateSchema applies in-place schema changes to caches created by earlier
 // versions of gocachez without bumping cacheSchemaVersion, so existing caches
 // keep working after an upgrade.
-func migrateSchema(ctx context.Context, db catalogDB) error {
+func migrateSchema(conn *sqlite.Conn) error {
 	for _, col := range []struct{ name, ddl string }{
 		{"blob_type", "blob_type INTEGER"},
 		{"blob_type_version", "blob_type_version INTEGER"},
 		{"retained_type", "retained_type INTEGER"},
 		{"retained_type_version", "retained_type_version INTEGER"},
 	} {
-		has, err := entriesHasColumn(ctx, db, col.name)
+		has, err := entriesHasColumn(conn, col.name)
 		if err != nil {
 			return fmt.Errorf("inspect entries schema: %w", err)
 		}
 		if !has {
-			if _, err := db.ExecContext(ctx, "ALTER TABLE entries ADD COLUMN "+col.ddl); err != nil {
+			if err := execute(conn, "ALTER TABLE entries ADD COLUMN "+col.ddl); err != nil {
 				return fmt.Errorf("add entries.%s column: %w", col.name, err)
 			}
 		}
 	}
 	// Keep the status GROUP BY output_id scan covering as cached classifications
 	// are added to the schema.
-	current, err := statusCoverIndexCurrent(ctx, db)
+	current, err := statusCoverIndexCurrent(conn)
 	if err != nil {
 		return fmt.Errorf("inspect entries_output_cover index: %w", err)
 	}
 	if !current {
-		if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
+		if err := execute(conn, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
 			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, `CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
+		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
 			return fmt.Errorf("create entries_output_cover index: %w", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS entries_output_id`); err != nil {
+	if err := execute(conn, `DROP INDEX IF EXISTS entries_output_id`); err != nil {
 		return fmt.Errorf("drop entries_output_id index: %w", err)
 	}
 	return nil
 }
 
-func statusCoverIndexCurrent(ctx context.Context, db catalogDB) (bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close() //nolint:errcheck
-
+func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 	want := []string{
 		"output_id",
 		"size",
@@ -308,14 +254,13 @@ func statusCoverIndexCurrent(ctx context.Context, db catalogDB) (bool, error) {
 		"retained_type_version",
 	}
 	var got []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return false, err
-		}
-		got = append(got, name)
-	}
-	if err := rows.Err(); err != nil {
+	err := sqlitex.Execute(conn, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`, &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			got = append(got, stmt.ColumnText(0))
+			return nil
+		},
+	})
+	if err != nil {
 		return false, err
 	}
 	return slices.Equal(got, want), nil
@@ -330,9 +275,6 @@ func (st *store) close() {
 	}
 	if err := st.prune(); err != nil && st.verbose {
 		log.Printf("gocachez: prune failed: %v", err)
-	}
-	if err := st.q.close(); err != nil && st.verbose {
-		log.Printf("gocachez: close prepared statements failed: %v", err)
 	}
 	if err := st.db.Close(); err != nil && st.verbose {
 		log.Printf("gocachez: close catalog failed: %v", err)
