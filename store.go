@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS runs (
 	lock_path TEXT NOT NULL,
 	created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS state (
+	key TEXT PRIMARY KEY,
+	value INTEGER NOT NULL
+);
 `
 
 type entry struct {
@@ -68,6 +73,7 @@ type store struct {
 	decoderPool       sync.Pool
 	materialized      map[string]string
 	accessed          map[string]int64
+	lastAccessFlush   time.Time
 }
 
 const retainedDirName = "retained"
@@ -148,6 +154,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		runLock:           runLock,
 		materialized:      make(map[string]string),
 		accessed:          make(map[string]int64),
+		lastAccessFlush:   time.Now(),
 	}
 	if err := st.registerRun(); err != nil {
 		_ = db.Close()
@@ -273,7 +280,7 @@ func (st *store) close() {
 	if err := st.unregisterRun(); err != nil && st.verbose {
 		log.Printf("gocachez: unregister run failed: %v", err)
 	}
-	if err := st.prune(); err != nil && st.verbose {
+	if err := st.pruneAutomatically(time.Now()); err != nil && st.verbose {
 		log.Printf("gocachez: prune failed: %v", err)
 	}
 	if err := st.db.Close(); err != nil && st.verbose {

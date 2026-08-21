@@ -875,6 +875,9 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(old)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.put(request{
 		ID:       2,
 		Command:  cmdPut,
@@ -1057,6 +1060,367 @@ func TestPruneUsesLifecycleLock(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAutomaticPruneSkipsRecentFullPrune(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputID := strings.Repeat("a", 64)
+	blobPath := st.blobPath(outputID)
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	now := time.Now()
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("recently pruned cache was pruned again: %v", err)
+	}
+}
+
+func TestAutomaticPruneRunsFullPruneAfterInterval(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	outputID := strings.Repeat("a", 64)
+	blobPath := st.blobPath(outputID)
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	now := time.Now()
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now.Add(-fullPruneInterval-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+	lastMillis, found, err := st.q.state(context.Background(), lastFullPruneStateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("last full prune was not recorded")
+	}
+	if last := millisTime(lastMillis); last.Before(now.Truncate(time.Millisecond)) {
+		t.Fatalf("last full prune = %v, want at or after %v", last, now)
+	}
+}
+
+func TestAutomaticPruneDoesNotRecordSkippedPrune(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st1, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st1.close()
+	st2, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.close()
+
+	execDB(t, st1.db, `DELETE FROM runs WHERE run_id = ?`, st1.runID)
+	if err := st1.pruneAutomatically(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := st1.q.state(context.Background(), lastFullPruneStateKey); err != nil || found {
+		t.Fatalf("last full prune: found=%t, err=%v; want not found", found, err)
+	}
+}
+
+func TestAutomaticPruneEnforcesSizeWithActiveRuns(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st1, err := newStore(config{
+		dir:     cacheDir,
+		maxSize: 320,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st1.close()
+	st2, err := newStore(config{
+		dir:     cacheDir,
+		maxSize: 320,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.close()
+
+	outputIDs := addSizedCacheEntries(t, st1, time.Now(), 4, 100)
+	orphanID := strings.Repeat("f", 64)
+	if err := os.MkdirAll(st1.blobDir(orphanID), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	orphanPath := st1.blobPath(orphanID)
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st1.pruneAutomatically(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := st1.q.state(context.Background(), lastFullPruneStateKey); err != nil || found {
+		t.Fatalf("last full prune: found=%t, err=%v; want not found", found, err)
+	}
+	if _, err := os.Stat(orphanPath); err != nil {
+		t.Fatalf("orphan was removed while another run was active: %v", err)
+	}
+	for _, outputID := range outputIDs[:2] {
+		if _, err := os.Stat(st1.blobPath(outputID)); !os.IsNotExist(err) {
+			t.Fatalf("old blob %s stat err = %v, want not exist", outputID, err)
+		}
+	}
+}
+
+func TestAutomaticPruneEnforcesSizeBetweenFullPrunes(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 320,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	outputIDs := addSizedCacheEntries(t, st, now, 4, 100)
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	total, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 200 {
+		t.Fatalf("compressed size after prune = %d, want 200", total)
+	}
+	for _, outputID := range outputIDs[:2] {
+		if _, err := os.Stat(st.blobPath(outputID)); !os.IsNotExist(err) {
+			t.Fatalf("old blob %s stat err = %v, want not exist", outputID, err)
+		}
+	}
+	for _, outputID := range outputIDs[2:] {
+		if _, err := os.Stat(st.blobPath(outputID)); err != nil {
+			t.Fatalf("new blob %s was pruned: %v", outputID, err)
+		}
+	}
+}
+
+func TestAutomaticPruneDoesNotPruneBelowMaximum(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 320,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	outputIDs := addSizedCacheEntries(t, st, now, 3, 100)
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if total, err := st.compressedSize(); err != nil || total != 300 {
+		t.Fatalf("compressed size = %d, err=%v; want 300", total, err)
+	}
+	for _, outputID := range outputIDs {
+		if _, err := os.Stat(st.blobPath(outputID)); err != nil {
+			t.Fatalf("blob %s was pruned below maxSize: %v", outputID, err)
+		}
+	}
+}
+
+func TestAutomaticPruneTreatsFutureTimestampAsDue(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	orphanID := strings.Repeat("f", 64)
+	if err := os.MkdirAll(st.blobDir(orphanID), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	orphanPath := st.blobPath(orphanID)
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	now := time.Now()
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+func TestEntryAccessesFlushAtThreshold(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	outputIDs := addSizedCacheEntries(t, st, now.Add(-time.Hour), accessFlushThreshold, 1)
+	st.lastAccessFlush = now.Add(-accessFlushMinInterval)
+	for i := range accessFlushThreshold {
+		if err := st.markEntryAccessAt(fmt.Sprintf("%064x", i+1), now.Add(time.Duration(i)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var accessedAt int64
+	queryDB(t, st.db, `SELECT accessed_at FROM entries WHERE output_id = ?`, []any{outputIDs[0]}, &accessedAt)
+	if accessedAt != unixMillis(now) {
+		t.Fatalf("accessed_at = %d, want %d", accessedAt, unixMillis(now))
+	}
+	if len(st.accessed) != 0 {
+		t.Fatalf("buffered accesses = %d, want 0", len(st.accessed))
+	}
+}
+
+func TestEntryAccessesFlushAfterInterval(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	addSizedCacheEntries(t, st, now.Add(-time.Hour), 1, 1)
+	st.lastAccessFlush = now.Add(-accessFlushInterval)
+	if err := st.markEntryAccessAt(fmt.Sprintf("%064x", 1), now); err != nil {
+		t.Fatal(err)
+	}
+
+	var accessedAt int64
+	queryDB(t, st.db, `SELECT accessed_at FROM entries WHERE action_id = ?`, []any{fmt.Sprintf("%064x", 1)}, &accessedAt)
+	if accessedAt != unixMillis(now) {
+		t.Fatalf("accessed_at = %d, want %d", accessedAt, unixMillis(now))
+	}
+}
+
+func TestEntryAccessFlushFailureRetainsPendingAccesses(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	st.lastAccessFlush = now.Add(-accessFlushMinInterval)
+	for i := range accessFlushThreshold - 1 {
+		st.accessed[fmt.Sprintf("%064x", i+1)] = unixMillis(now)
+	}
+	abandonStore(t, st)
+
+	actionID := fmt.Sprintf("%064x", accessFlushThreshold)
+	if err := st.markEntryAccessAt(actionID, now); err == nil {
+		t.Fatal("markEntryAccessAt succeeded with closed database")
+	}
+	st.mu.Lock()
+	accessedAt, found := st.accessed[actionID]
+	st.mu.Unlock()
+	if !found || accessedAt != unixMillis(now) {
+		t.Fatalf("pending access = (%d, %t), want (%d, true)", accessedAt, found, unixMillis(now))
+	}
+
+	if err := st.markEntryAccessAt(fmt.Sprintf("%064x", accessFlushThreshold+1), now.Add(accessFlushMinInterval/2)); err != nil {
+		t.Fatalf("access flush retried before minimum interval: %v", err)
+	}
+}
+
+func TestEntryAccessTimesDoNotMoveBackward(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	addSizedCacheEntries(t, st, now, 1, 1)
+	actionID := fmt.Sprintf("%064x", 1)
+	if err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
+		return touchEntries(conn, map[string]int64{actionID: unixMillis(now.Add(-time.Hour))})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var accessedAt int64
+	queryDB(t, st.db, `SELECT accessed_at FROM entries WHERE action_id = ?`, []any{actionID}, &accessedAt)
+	if accessedAt != unixMillis(now) {
+		t.Fatalf("accessed_at = %d, want %d", accessedAt, unixMillis(now))
 	}
 }
 
@@ -3209,6 +3573,34 @@ func execDB(t *testing.T, db *sqliteDB, query string, args ...any) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func addSizedCacheEntries(t *testing.T, st *store, now time.Time, count int, size int64) []string {
+	t.Helper()
+
+	outputIDs := make([]string, count)
+	for i := range count {
+		actionID := fmt.Sprintf("%064x", i+1)
+		outputID := fmt.Sprintf("%064x", i+count+1)
+		outputIDs[i] = outputID
+		if err := os.MkdirAll(st.blobDir(outputID), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(st.blobPath(outputID), []byte("blob"), 0o666); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.upsertEntry(entry{
+			ActionID:       actionID,
+			OutputID:       outputID,
+			Size:           size,
+			CompressedSize: size,
+			CreatedAt:      now.Add(time.Duration(i) * time.Second),
+			AccessedAt:     now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return outputIDs
 }
 
 func queryDB(t *testing.T, db *sqliteDB, query string, args []any, dest ...any) {

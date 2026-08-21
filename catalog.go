@@ -32,7 +32,7 @@ ON CONFLICT(action_id) DO UPDATE SET
 
 const touchEntrySQL = `
 UPDATE entries
-SET accessed_at = ?
+SET accessed_at = MAX(accessed_at, ?)
 WHERE action_id = ?`
 
 type catalog struct {
@@ -105,6 +105,33 @@ func (c *catalog) countRuns(ctx context.Context) (int64, error) {
 		return err
 	})
 	return count, err
+}
+
+func (c *catalog) state(ctx context.Context, key string) (int64, bool, error) {
+	var value int64
+	var found bool
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		found, err = queryPrepared(conn, `
+SELECT value
+FROM state
+WHERE key = ?`, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, key)
+		}, func(stmt *sqlite.Stmt) {
+			value = stmt.ColumnInt64(0)
+		})
+		return err
+	})
+	return value, found, err
+}
+
+func (c *catalog) setState(ctx context.Context, key string, value int64) error {
+	return c.useConn(ctx, func(conn *sqlite.Conn) error {
+		return execute(conn, `
+INSERT INTO state(key, value)
+VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	})
 }
 
 func (c *catalog) deleteRun(ctx context.Context, runID string) error {

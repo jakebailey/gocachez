@@ -26,7 +26,13 @@ const (
 	// mtimeInterval mirrors cmd/go's DiskCache: retained-file mtimes are updated
 	// at most once per interval to avoid churn. The age cutoff itself is the
 	// configurable maxAge (see config); the default matches GOCACHE's 5 days.
-	mtimeInterval = time.Hour
+	mtimeInterval          = time.Hour
+	fullPruneInterval      = time.Hour
+	sizePruneTargetPercent = 90
+	lastFullPruneStateKey  = "last-full-prune"
+	accessFlushInterval    = 30 * time.Second
+	accessFlushThreshold   = 256
+	accessFlushMinInterval = time.Second
 )
 
 var decoderOptions = []zstd.DOption{
@@ -201,24 +207,58 @@ func (st *store) deleteMaterialized(outputID string) {
 }
 
 func (st *store) markEntryAccess(actionID string) {
+	if err := st.markEntryAccessAt(actionID, time.Now()); err != nil && st.verbose {
+		log.Printf("gocachez: flush access times failed: %v", err)
+	}
+}
+
+func (st *store) markEntryAccessAt(actionID string, now time.Time) error {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.accessed[actionID] = unixMillis(time.Now())
+	st.accessed[actionID] = unixMillis(now)
+	elapsed := now.Sub(st.lastAccessFlush)
+	shouldFlush := elapsed >= accessFlushInterval ||
+		(len(st.accessed) >= accessFlushThreshold && elapsed >= accessFlushMinInterval)
+	if !shouldFlush {
+		st.mu.Unlock()
+		return nil
+	}
+	accessed := st.accessed
+	st.accessed = make(map[string]int64)
+	st.lastAccessFlush = now
+	st.mu.Unlock()
+	return st.writeAccessTimes(accessed)
 }
 
 func (st *store) flushAccessTimes() error {
+	return st.flushAccessTimesAt(time.Now())
+}
+
+func (st *store) flushAccessTimesAt(now time.Time) error {
 	st.mu.Lock()
 	accessed := st.accessed
 	st.accessed = make(map[string]int64)
+	st.lastAccessFlush = now
 	st.mu.Unlock()
 	if len(accessed) == 0 {
 		return nil
 	}
+	return st.writeAccessTimes(accessed)
+}
 
-	ctx := context.Background()
-	return st.db.withTx(ctx, func(conn *sqlite.Conn) error {
+func (st *store) writeAccessTimes(accessed map[string]int64) error {
+	err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
 		return touchEntries(conn, accessed)
 	})
+	if err == nil {
+		return nil
+	}
+
+	st.mu.Lock()
+	for actionID, accessedAt := range accessed {
+		st.accessed[actionID] = max(st.accessed[actionID], accessedAt)
+	}
+	st.mu.Unlock()
+	return err
 }
 
 func (st *store) materialize(ent entry) (string, error) {
@@ -346,38 +386,84 @@ func (st *store) deleteOutput(outputID string) error {
 }
 
 func (st *store) prune() error {
-	return st.withLifecycleLock(st.pruneLocked)
+	return st.withLifecycleLock(func() error {
+		activeRuns, err := st.prepareToPruneLocked()
+		if err != nil || activeRuns > 0 {
+			return err
+		}
+		if err := st.pruneOldDataLocked(time.Now()); err != nil {
+			return err
+		}
+		if err := st.pruneSizeLocked(st.maxSize); err != nil {
+			return err
+		}
+		return st.removeOrphanOutputFiles(true)
+	})
 }
 
-func (st *store) pruneLocked() error {
+func (st *store) pruneAutomatically(now time.Time) error {
+	return st.withLifecycleLock(func() error {
+		activeRuns, err := st.prepareToPruneLocked()
+		if err != nil {
+			return err
+		}
+
+		if st.maxSize > 0 {
+			target := st.maxSize * sizePruneTargetPercent / 100
+			if err := st.pruneSizeLocked(target); err != nil {
+				return err
+			}
+		}
+
+		if activeRuns > 0 {
+			return nil
+		}
+
+		fullPruneDue, err := st.fullPruneDue(now)
+		if err != nil || !fullPruneDue {
+			return err
+		}
+		if err := st.pruneOldDataLocked(now); err != nil {
+			return err
+		}
+		if err := st.removeOrphanOutputFiles(true); err != nil {
+			return err
+		}
+		return st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now))
+	})
+}
+
+func (st *store) prepareToPruneLocked() (int64, error) {
 	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
 		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 	}
 	activeRuns, err := st.q.countRuns(context.Background())
 	if err != nil {
-		return fmt.Errorf("count active runs: %w", err)
+		return 0, fmt.Errorf("count active runs: %w", err)
 	}
-	if activeRuns > 0 {
-		return nil
-	}
-	if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
+	return activeRuns, nil
+}
+
+func (st *store) pruneOldDataLocked(now time.Time) error {
+	if err := st.pruneOldRetainedFiles(now); err != nil {
 		return err
 	}
-	if err := st.pruneOldRetainedLiveDirs(time.Now()); err != nil {
+	if err := st.pruneOldRetainedLiveDirs(now); err != nil {
 		return err
 	}
-	if err := st.pruneOldEntries(time.Now()); err != nil {
-		return err
-	}
+	return st.pruneOldEntries(now)
+}
+
+func (st *store) pruneSizeLocked(target int64) error {
 	if st.maxSize <= 0 {
-		return st.removeOrphanOutputFiles(true)
+		return nil
 	}
 	total, err := st.compressedSize()
 	if err != nil {
 		return err
 	}
 	if total <= st.maxSize {
-		return st.removeOrphanOutputFiles(true)
+		return nil
 	}
 
 	candidates, err := st.pruneCandidates()
@@ -386,7 +472,7 @@ func (st *store) pruneLocked() error {
 	}
 	removed := 0
 	for _, candidate := range candidates {
-		if total <= st.maxSize {
+		if total <= target {
 			break
 		}
 		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -401,8 +487,22 @@ func (st *store) pruneLocked() error {
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d blobs, compressed size now %s", removed, formatSize(total))
 	}
+	return nil
+}
 
-	return st.removeOrphanOutputFiles(true)
+func (st *store) fullPruneDue(now time.Time) (bool, error) {
+	lastMillis, found, err := st.q.state(context.Background(), lastFullPruneStateKey)
+	if err != nil {
+		return false, fmt.Errorf("read last full prune: %w", err)
+	}
+	if !found {
+		return true, nil
+	}
+	last := millisTime(lastMillis)
+	if last.After(now) {
+		return true, nil
+	}
+	return now.Sub(last) >= fullPruneInterval, nil
 }
 
 type pruneCandidate struct {
