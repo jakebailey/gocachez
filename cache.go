@@ -64,6 +64,8 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	if err := os.MkdirAll(blobDir, 0o777); err != nil {
 		return response{}, fmt.Errorf("create blob dir: %w", err)
 	}
+	blobPath := st.blobPath(outputHex)
+	compressedSize, blobExists := existingFileSize(blobPath)
 
 	bodyPath, err := st.createLiveFile(outputHex)
 	if err != nil {
@@ -76,52 +78,38 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		}
 	}()
 
-	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
-	if err != nil {
-		return response{}, fmt.Errorf("create compressed file: %w", err)
-	}
-	blobTmpPath := blobTmp.Name()
-	defer func() {
-		_ = os.Remove(blobTmpPath)
-	}()
-
 	bodyFile, err := os.Create(bodyPath)
 	if err != nil {
-		_ = blobTmp.Close()
 		return response{}, fmt.Errorf("create live file: %w", err)
 	}
-	zw, err := st.getEncoder(blobTmp)
-	if err != nil {
-		_ = bodyFile.Close()
-		_ = blobTmp.Close()
-		return response{}, fmt.Errorf("create zstd encoder: %w", err)
-	}
 
-	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw), body)
-	closeErr := zw.Close()
-	st.putEncoder(zw)
+	var written int64
+	if blobExists {
+		written, err = io.Copy(bodyFile, body)
+	} else {
+		written, compressedSize, err = st.writeNewBlob(bodyFile, body, blobDir, outputHex)
+	}
 	bodyCloseErr := bodyFile.Close()
-	blobCloseErr := blobTmp.Close()
-	if copyErr != nil {
-		return response{}, fmt.Errorf("read put body: %w", copyErr)
+	if err != nil {
+		return response{}, fmt.Errorf("read put body: %w", err)
 	}
 	bodyDrained = true
-	if closeErr != nil {
-		return response{}, fmt.Errorf("finish zstd stream: %w", closeErr)
-	}
 	if bodyCloseErr != nil {
 		return response{}, fmt.Errorf("close live file: %w", bodyCloseErr)
-	}
-	if blobCloseErr != nil {
-		return response{}, fmt.Errorf("close compressed file: %w", blobCloseErr)
 	}
 	if written != req.BodySize {
 		return response{}, fmt.Errorf("put body size mismatch: got %d bytes, expected %d", written, req.BodySize)
 	}
 
-	compressedSize, err := st.installBlob(blobTmpPath, outputHex)
-	if err != nil {
-		return response{}, err
+	if blobExists {
+		if size, ok := existingFileSize(blobPath); ok {
+			compressedSize = size
+		} else {
+			compressedSize, err = st.compressLiveFile(bodyPath, blobDir, outputHex)
+			if err != nil {
+				return response{}, err
+			}
+		}
 	}
 
 	now := time.Now()
@@ -143,6 +131,79 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 		ID:       req.ID,
 		DiskPath: bodyPath,
 	}, nil
+}
+
+func (st *store) writeNewBlob(bodyFile *os.File, body io.Reader, blobDir, outputHex string) (int64, int64, error) {
+	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
+	if err != nil {
+		return 0, 0, fmt.Errorf("create compressed file: %w", err)
+	}
+	blobTmpPath := blobTmp.Name()
+	defer os.Remove(blobTmpPath) //nolint:errcheck
+
+	zw, err := st.getEncoder(blobTmp)
+	if err != nil {
+		_ = blobTmp.Close()
+		return 0, 0, fmt.Errorf("create zstd encoder: %w", err)
+	}
+	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw), body)
+	encoderCloseErr := zw.Close()
+	st.putEncoder(zw)
+	blobCloseErr := blobTmp.Close()
+	if copyErr != nil {
+		return 0, 0, copyErr
+	}
+	if encoderCloseErr != nil {
+		return 0, 0, fmt.Errorf("finish zstd stream: %w", encoderCloseErr)
+	}
+	if blobCloseErr != nil {
+		return 0, 0, fmt.Errorf("close compressed file: %w", blobCloseErr)
+	}
+	compressedSize, err := st.installBlob(blobTmpPath, outputHex)
+	return written, compressedSize, err
+}
+
+func (st *store) compressLiveFile(bodyPath, blobDir, outputHex string) (int64, error) {
+	body, err := os.Open(bodyPath)
+	if err != nil {
+		return 0, fmt.Errorf("open live file for compression: %w", err)
+	}
+	defer body.Close() //nolint:errcheck
+
+	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
+	if err != nil {
+		return 0, fmt.Errorf("create compressed file: %w", err)
+	}
+	blobTmpPath := blobTmp.Name()
+	defer os.Remove(blobTmpPath) //nolint:errcheck
+
+	zw, err := st.getEncoder(blobTmp)
+	if err != nil {
+		_ = blobTmp.Close()
+		return 0, fmt.Errorf("create zstd encoder: %w", err)
+	}
+	_, copyErr := io.Copy(zw, body)
+	encoderCloseErr := zw.Close()
+	st.putEncoder(zw)
+	blobCloseErr := blobTmp.Close()
+	if copyErr != nil {
+		return 0, fmt.Errorf("compress live file: %w", copyErr)
+	}
+	if encoderCloseErr != nil {
+		return 0, fmt.Errorf("finish zstd stream: %w", encoderCloseErr)
+	}
+	if blobCloseErr != nil {
+		return 0, fmt.Errorf("close compressed file: %w", blobCloseErr)
+	}
+	return st.installBlob(blobTmpPath, outputHex)
+}
+
+func existingFileSize(path string) (int64, bool) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return 0, false
+	}
+	return info.Size(), true
 }
 
 func (st *store) get(req request) (response, error) {
@@ -394,6 +455,9 @@ func (st *store) prune() error {
 		if err := st.pruneOldDataLocked(time.Now()); err != nil {
 			return err
 		}
+		if _, err := st.q.reconcileCompressedSize(context.Background()); err != nil {
+			return fmt.Errorf("reconcile compressed size: %w", err)
+		}
 		if err := st.pruneSizeLocked(st.maxSize); err != nil {
 			return err
 		}
@@ -408,22 +472,24 @@ func (st *store) pruneAutomatically(now time.Time) error {
 			return err
 		}
 
-		if st.maxSize > 0 {
-			target := st.maxSize * sizePruneTargetPercent / 100
-			if err := st.pruneSizeLocked(target); err != nil {
-				return err
-			}
-		}
-
 		if activeRuns > 0 {
-			return nil
+			return st.pruneSizeWithHysteresis()
 		}
 
 		fullPruneDue, err := st.fullPruneDue(now)
-		if err != nil || !fullPruneDue {
+		if err != nil {
 			return err
 		}
+		if !fullPruneDue {
+			return st.pruneSizeWithHysteresis()
+		}
 		if err := st.pruneOldDataLocked(now); err != nil {
+			return err
+		}
+		if _, err := st.q.reconcileCompressedSize(context.Background()); err != nil {
+			return fmt.Errorf("reconcile compressed size: %w", err)
+		}
+		if err := st.pruneSizeWithHysteresis(); err != nil {
 			return err
 		}
 		if err := st.removeOrphanOutputFiles(true); err != nil {
@@ -431,6 +497,14 @@ func (st *store) pruneAutomatically(now time.Time) error {
 		}
 		return st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now))
 	})
+}
+
+func (st *store) pruneSizeWithHysteresis() error {
+	if st.maxSize <= 0 {
+		return nil
+	}
+	target := st.maxSize * sizePruneTargetPercent / 100
+	return st.pruneSizeLocked(target)
 }
 
 func (st *store) prepareToPruneLocked() (int64, error) {
@@ -552,33 +626,42 @@ func (st *store) pruneOldRetainedFiles(now time.Time) error {
 		return fmt.Errorf("stat retained root: %w", err)
 	}
 	cutoff := trimCutoff(st.maxAge, now)
-	removed := 0
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || (!strings.HasSuffix(path, ".a") && !strings.HasSuffix(path, ".go")) {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return fmt.Errorf("stat retained file: %w", err)
-		}
-		if info.ModTime().Before(cutoff) {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove old retained file: %w", err)
-			}
-			removed++
-		}
-		return nil
-	})
+	shards, err := os.ReadDir(root)
 	if err != nil {
-		return err
+		return fmt.Errorf("read retained root: %w", err)
+	}
+	removed := 0
+	for _, shard := range shards {
+		if !shard.IsDir() {
+			continue
+		}
+		shardPath := filepath.Join(root, shard.Name())
+		files, err := os.ReadDir(shardPath)
+		if err != nil {
+			return fmt.Errorf("read retained shard: %w", err)
+		}
+		for _, file := range files {
+			if file.IsDir() || (!strings.HasSuffix(file.Name(), ".a") && !strings.HasSuffix(file.Name(), ".go")) {
+				continue
+			}
+			info, err := file.Info()
+			if err != nil {
+				return fmt.Errorf("stat retained file: %w", err)
+			}
+			if info.ModTime().Before(cutoff) {
+				if err := os.Remove(filepath.Join(shardPath, file.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("remove old retained file: %w", err)
+				}
+				removed++
+			}
+		}
+		removeDirIfEmpty(shardPath)
 	}
 	if st.verbose && removed > 0 {
 		log.Printf("gocachez: pruned %d old retained files", removed)
 	}
-	return removeEmptyDirs(root)
+	removeDirIfEmpty(root)
+	return nil
 }
 
 func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
@@ -686,64 +769,38 @@ func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
 			return fmt.Errorf("remove orphan retained files in shard %s: %w", lower, err)
 		}
 	}
-	if includeBlobs {
-		if err := removeEmptyDirs(st.blobsDir); err != nil {
-			return err
-		}
-	}
-	return removeEmptyDirs(retainedRoot(st.versionDir))
+	return nil
 }
 
 func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensions ...string) error {
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
 		}
-		if d.IsDir() {
-			return nil
-		}
-		ext := filepath.Ext(path)
+		ext := filepath.Ext(entry.Name())
 		if !slices.Contains(extensions, ext) {
-			return nil
+			continue
 		}
-		outputID := strings.TrimSuffix(filepath.Base(path), ext)
+		outputID := strings.TrimSuffix(entry.Name(), ext)
 		if _, ok := referenced[outputID]; !ok {
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(filepath.Join(root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
-		return nil
-	})
-	return err
+	}
+	removeDirIfEmpty(root)
+	return nil
 }
 
-func removeEmptyDirs(root string) error {
-	var dirs []string
-	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if d.IsDir() && path != root {
-			dirs = append(dirs, path)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, dir := range slices.Backward(dirs) {
-		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-			if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) != 0 {
-				continue
-			}
-		}
-	}
-	return nil
+func removeDirIfEmpty(path string) {
+	_ = os.Remove(path)
 }
 
 func (st *store) blobDir(outputHex string) string {

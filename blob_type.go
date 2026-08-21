@@ -97,14 +97,32 @@ func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTy
 }
 
 func persistBlobTypes(dbPath string, classified map[string]blobTypeKind) error {
-	db, err := openDB(dbPath)
+	db, err := openWritableExistingDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
 
-	ctx := context.Background()
-	return db.withTx(ctx, func(conn *sqlite.Conn) error {
+	const batchSize = 1000
+	batch := make(map[string]blobTypeKind, batchSize)
+	for outputID, kind := range classified {
+		batch[outputID] = kind
+		if len(batch) < batchSize {
+			continue
+		}
+		if err := persistBlobTypeBatch(db, batch); err != nil {
+			return err
+		}
+		clear(batch)
+	}
+	if len(batch) > 0 {
+		return persistBlobTypeBatch(db, batch)
+	}
+	return nil
+}
+
+func persistBlobTypeBatch(db *sqliteDB, classified map[string]blobTypeKind) error {
+	return db.withTx(context.Background(), func(conn *sqlite.Conn) error {
 		for outputID, kind := range classified {
 			if err := updateBlobType(conn, outputID, kind, blobClassifierVersion); err != nil {
 				return err

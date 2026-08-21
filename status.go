@@ -114,7 +114,7 @@ func writeStatus(cfg config, w io.Writer) error {
 }
 
 func readStatus(cfg config) (cacheStatus, error) {
-	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	versionDir, blobsDir, liveRoot, _ := cachePaths(cfg)
 	status := cacheStatus{
 		cacheDir:   cfg.dir,
 		maxSize:    cfg.maxSize,
@@ -128,32 +128,22 @@ func readStatus(cfg config) (cacheStatus, error) {
 		return cacheStatus{}, fmt.Errorf("stat cache version dir: %w", err)
 	}
 
-	st := &store{
-		config:            cfg,
-		versionDir:        versionDir,
-		blobsDir:          blobsDir,
-		liveRoot:          liveRoot,
-		lifecycleLockPath: lifecycleLockPath,
+	dbPath := filepath.Join(versionDir, "cache.db")
+	catalogExists, catalog, outputs, err := readCatalogStatus(dbPath)
+	if err != nil {
+		return cacheStatus{}, err
 	}
-	err := st.withLifecycleLock(func() error {
-		var err error
-		dbPath := filepath.Join(versionDir, "cache.db")
-		var outputs []catalogOutput
-		status.catalogExists, status.catalog, outputs, err = readCatalogStatus(dbPath)
-		if err != nil {
-			return err
-		}
-		// Blob file count matches the number of cached outputs, so derive it
-		// from the catalog instead of walking the blobs directory.
-		status.blobFiles = status.catalog.outputs
-		status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
-		status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
-		if err != nil {
-			return err
-		}
-		status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
-		return err
-	})
+	status.catalogExists = catalogExists
+	status.catalog = catalog
+	// Blob file count matches the number of cached outputs, so derive it
+	// from the catalog instead of walking the blobs directory.
+	status.blobFiles = status.catalog.outputs
+	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
+	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
+	if err != nil {
+		return cacheStatus{}, err
+	}
+	status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
 	if err != nil {
 		return cacheStatus{}, err
 	}
@@ -504,14 +494,32 @@ func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, in
 }
 
 func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind) error {
-	db, err := openDB(dbPath)
+	db, err := openWritableExistingDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close() //nolint:errcheck
 
-	ctx := context.Background()
-	return db.withTx(ctx, func(conn *sqlite.Conn) error {
+	const batchSize = 1000
+	batch := make(map[string]retainedTypeKind, batchSize)
+	for outputID, kind := range classified {
+		batch[outputID] = kind
+		if len(batch) < batchSize {
+			continue
+		}
+		if err := persistRetainedTypeBatch(db, batch); err != nil {
+			return err
+		}
+		clear(batch)
+	}
+	if len(batch) > 0 {
+		return persistRetainedTypeBatch(db, batch)
+	}
+	return nil
+}
+
+func persistRetainedTypeBatch(db *sqliteDB, classified map[string]retainedTypeKind) error {
+	return db.withTx(context.Background(), func(conn *sqlite.Conn) error {
 		for outputID, kind := range classified {
 			if err := updateRetainedType(conn, outputID, kind); err != nil {
 				return err
@@ -526,7 +534,7 @@ func retainedFileKind(path string) retainedTypeKind {
 	case ".a":
 		return retainedTypeExportArchive
 	case ".go":
-		data, err := os.ReadFile(path)
+		data, err := readFilePrefix(path, generatedSourcePrefixLimit)
 		if err != nil {
 			return retainedTypeOther
 		}

@@ -35,6 +35,8 @@ UPDATE entries
 SET accessed_at = MAX(accessed_at, ?)
 WHERE action_id = ?`
 
+const compressedSizeStateKey = "compressed-size"
+
 type catalog struct {
 	db *sqliteDB
 }
@@ -143,15 +145,45 @@ WHERE run_id = ?`, runID)
 }
 
 func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
-	return c.useConn(ctx, func(conn *sqlite.Conn) error {
-		return execPrepared(conn, upsertEntrySQL, func(stmt *sqlite.Stmt) {
+	return c.db.withTx(ctx, func(conn *sqlite.Conn) error {
+		var oldOutputID string
+		oldFound, err := queryPrepared(conn, `
+SELECT output_id
+FROM entries
+WHERE action_id = ?`, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, ent.ActionID)
+		}, func(stmt *sqlite.Stmt) {
+			oldOutputID = stmt.ColumnText(0)
+		})
+		if err != nil {
+			return err
+		}
+
+		outputIDs := []string{ent.OutputID}
+		if oldFound && oldOutputID != ent.OutputID {
+			outputIDs = append(outputIDs, oldOutputID)
+		}
+		before, err := outputSizeSum(conn, outputIDs)
+		if err != nil {
+			return err
+		}
+
+		if err := execPrepared(conn, upsertEntrySQL, func(stmt *sqlite.Stmt) {
 			stmt.BindText(1, ent.ActionID)
 			stmt.BindText(2, ent.OutputID)
 			stmt.BindInt64(3, ent.Size)
 			stmt.BindInt64(4, ent.CompressedSize)
 			stmt.BindInt64(5, unixMillis(ent.CreatedAt))
 			stmt.BindInt64(6, unixMillis(ent.AccessedAt))
-		})
+		}); err != nil {
+			return err
+		}
+
+		after, err := outputSizeSum(conn, outputIDs)
+		if err != nil {
+			return err
+		}
+		return adjustState(conn, compressedSizeStateKey, after-before)
 	})
 }
 
@@ -197,23 +229,31 @@ func touchEntries(conn *sqlite.Conn, accessed map[string]int64) error {
 }
 
 func (c *catalog) deleteEntriesByOutputID(ctx context.Context, outputID string) error {
-	return c.useConn(ctx, func(conn *sqlite.Conn) error {
-		return execute(conn, `
+	return c.db.withTx(ctx, func(conn *sqlite.Conn) error {
+		size, err := outputSizeSum(conn, []string{outputID})
+		if err != nil {
+			return err
+		}
+		if err := execute(conn, `
 DELETE FROM entries
-WHERE output_id = ?`, outputID)
+WHERE output_id = ?`, outputID); err != nil {
+			return err
+		}
+		return adjustState(conn, compressedSizeStateKey, -size)
 	})
 }
 
 func (c *catalog) deleteEntriesAccessedBefore(ctx context.Context, cutoff int64) (int64, error) {
 	var removed int64
-	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+	err := c.db.withTx(ctx, func(conn *sqlite.Conn) error {
 		if err := execute(conn, `
 DELETE FROM entries
 WHERE accessed_at < ?`, cutoff); err != nil {
 			return err
 		}
 		removed = int64(conn.Changes())
-		return nil
+		_, err := reconcileCompressedSize(conn)
+		return err
 	})
 	return removed, err
 }
@@ -221,14 +261,24 @@ WHERE accessed_at < ?`, cutoff); err != nil {
 func (c *catalog) compressedSize(ctx context.Context) (int64, error) {
 	var size int64
 	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		value, found, err := stateValue(conn, compressedSizeStateKey)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("missing %s state", compressedSizeStateKey)
+		}
+		size = value
+		return nil
+	})
+	return size, err
+}
+
+func (c *catalog) reconcileCompressedSize(ctx context.Context) (int64, error) {
+	var size int64
+	err := c.db.withTx(ctx, func(conn *sqlite.Conn) error {
 		var err error
-		size, err = queryInt64(conn, `
-SELECT CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
-FROM (
-	SELECT output_id, MAX(compressed_size) AS compressed_size
-	FROM entries
-	GROUP BY output_id
-)`, nil)
+		size, err = reconcileCompressedSize(conn)
 		return err
 	})
 	return size, err
@@ -357,4 +407,68 @@ ORDER BY MAX(e.accessed_at)`, &sqlitex.ExecOptions{
 		})
 	})
 	return candidates, err
+}
+
+func outputSizeSum(conn *sqlite.Conn, outputIDs []string) (int64, error) {
+	var total int64
+	for _, outputID := range outputIDs {
+		size, err := queryInt64(conn, `
+SELECT CAST(COALESCE(MAX(compressed_size), 0) AS INTEGER)
+FROM entries
+WHERE output_id = ?`, []any{outputID})
+		if err != nil {
+			return 0, err
+		}
+		total += size
+	}
+	return total, nil
+}
+
+func stateValue(conn *sqlite.Conn, key string) (int64, bool, error) {
+	var value int64
+	found, err := queryPrepared(conn, `
+SELECT value
+FROM state
+WHERE key = ?`, func(stmt *sqlite.Stmt) {
+		stmt.BindText(1, key)
+	}, func(stmt *sqlite.Stmt) {
+		value = stmt.ColumnInt64(0)
+	})
+	return value, found, err
+}
+
+func adjustState(conn *sqlite.Conn, key string, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	if err := execute(conn, `
+UPDATE state
+SET value = value + ?
+WHERE key = ? AND value + ? >= 0`, delta, key, delta); err != nil {
+		return err
+	}
+	if conn.Changes() != 1 {
+		return fmt.Errorf("adjust state %q by %d: state missing or result would be negative", key, delta)
+	}
+	return nil
+}
+
+func reconcileCompressedSize(conn *sqlite.Conn) (int64, error) {
+	size, err := queryInt64(conn, `
+SELECT CAST(COALESCE(SUM(compressed_size), 0) AS INTEGER)
+FROM (
+	SELECT output_id, MAX(compressed_size) AS compressed_size
+	FROM entries
+	GROUP BY output_id
+)`, nil)
+	if err != nil {
+		return 0, err
+	}
+	if err := execute(conn, `
+INSERT INTO state(key, value)
+VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, compressedSizeStateKey, size); err != nil {
+		return 0, err
+	}
+	return size, nil
 }

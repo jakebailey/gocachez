@@ -133,7 +133,6 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		_ = os.RemoveAll(runDir)
 		return nil, fmt.Errorf("lock live run: %w", err)
 	}
-
 	db, err := openDB(filepath.Join(versionDir, "cache.db"))
 	if err != nil {
 		_ = runLock.Unlock()
@@ -141,6 +140,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		_ = os.RemoveAll(runDir)
 		return nil, err
 	}
+
 	st := &store{
 		config:            cfg,
 		db:                db,
@@ -199,6 +199,13 @@ func initDB(db *sqliteDB) error {
 		}
 		if err := sqlitex.ExecuteScript(conn, catalogSchema, nil); err != nil {
 			return fmt.Errorf("initialize catalog: %w", err)
+		}
+		if _, found, err := stateValue(conn, compressedSizeStateKey); err != nil {
+			return fmt.Errorf("inspect compressed size state: %w", err)
+		} else if !found {
+			if _, err := reconcileCompressedSize(conn); err != nil {
+				return fmt.Errorf("initialize compressed size state: %w", err)
+			}
 		}
 		if err := migrateSchema(conn); err != nil {
 			return err
@@ -366,7 +373,12 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 	if outputID == "" {
 		return stripPackageArchiveToExport(path, "")
 	}
-	retained, err := stripPackageArchiveToExport(path, st.retainedPath(outputID, ".a"))
+	onCopyFallback := func() {
+		if st.verbose {
+			log.Printf("gocachez: hard link unavailable for retained file %s; copying instead", outputID)
+		}
+	}
+	retained, err := stripPackageArchiveToExportWithFallback(path, st.retainedPath(outputID, ".a"), onCopyFallback)
 	if err != nil {
 		return false, err
 	}
@@ -378,7 +390,7 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 		}
 		return true, nil
 	}
-	kind, retained, err := retainEscapedGeneratedGoSource(path, st.retainedPath(outputID, ".go"))
+	kind, retained, err := retainEscapedGeneratedGoSourceWithFallback(path, st.retainedPath(outputID, ".go"), onCopyFallback)
 	if err != nil || !retained {
 		return retained, err
 	}

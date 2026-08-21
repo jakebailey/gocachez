@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -304,6 +305,54 @@ func TestPutAcceptsZeroSizeBody(t *testing.T) {
 	}
 	if getRes.Miss || getRes.Size != 0 {
 		t.Fatalf("get response = %+v", getRes)
+	}
+}
+
+func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	body := bytes.Repeat([]byte("duplicate output"), 1024)
+	outputID := sha256Sum(body)
+	outputHex := hexOf(outputID)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{41}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		t.Fatal(err)
+	}
+	originalBlob, err := os.ReadFile(st.blobPath(outputHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removeReader := &removeFileReader{
+		reader: encodedBody(body),
+		path:   st.blobPath(outputHex),
+	}
+	if _, err := st.put(request{
+		ID:       2,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{42}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(removeReader)); err != nil {
+		t.Fatal(err)
+	}
+	recreatedBlob, err := os.ReadFile(st.blobPath(outputHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recreatedBlob, originalBlob) {
+		t.Fatal("recreated blob differs from original compressed content")
 	}
 }
 
@@ -955,6 +1004,57 @@ func TestCloseRetainsGeneratedTestmainLiveFile(t *testing.T) {
 	assertCloseRetainsGeneratedGoSource(t, body, bytes.Repeat([]byte{75}, 32), bytes.Repeat([]byte{76}, 32))
 }
 
+func TestCloseDoesNotRetainBinaryContainingCgoMarkers(t *testing.T) {
+	t.Parallel()
+
+	body := append([]byte{0x7f, 'E', 'L', 'F', 0}, []byte("package main\n"+generatedCgoDirective+"import_dynamic x x \"libc.so\"\n")...)
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputID := bytes.Repeat([]byte{77}, 32)
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{78}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.close()
+
+	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("binary live file stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(retainedPath(cacheDir, outputID, ".go")); !os.IsNotExist(err) {
+		t.Fatalf("retained binary stat err = %v, want not exist", err)
+	}
+}
+
+func TestGeneratedSourceClassificationUsesBoundedPrefix(t *testing.T) {
+	t.Parallel()
+
+	data := bytes.Repeat([]byte("x"), generatedSourcePrefixLimit)
+	data = append(data, []byte("\npackage main\n"+generatedCgoDirective+"import_dynamic x x \"libc.so\"\n")...)
+	path := filepath.Join(t.TempDir(), "large")
+	if err := os.WriteFile(path, data, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	prefix, err := readFilePrefix(path, generatedSourcePrefixLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prefix) != generatedSourcePrefixLimit {
+		t.Fatalf("prefix length = %d, want %d", len(prefix), generatedSourcePrefixLimit)
+	}
+	if _, ok := retainedGeneratedSourceKind(prefix); ok {
+		t.Fatal("marker beyond classification prefix was accepted")
+	}
+}
+
 func assertCloseRetainsGeneratedGoSource(t *testing.T, body, actionID, outputID []byte) {
 	t.Helper()
 
@@ -1315,6 +1415,189 @@ func TestAutomaticPruneTreatsFutureTimestampAsDue(t *testing.T) {
 	}
 	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
 		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	}
+}
+
+func TestCompressedSizeTracksDistinctOutputs(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	output1 := strings.Repeat("1", 64)
+	output2 := strings.Repeat("2", 64)
+	entry1 := entry{
+		ActionID:       strings.Repeat("a", 64),
+		OutputID:       output1,
+		Size:           100,
+		CompressedSize: 40,
+		CreatedAt:      now,
+		AccessedAt:     now,
+	}
+	if err := st.q.upsertEntry(context.Background(), entry1); err != nil {
+		t.Fatal(err)
+	}
+	entry2 := entry1
+	entry2.ActionID = strings.Repeat("b", 64)
+	if err := st.q.upsertEntry(context.Background(), entry2); err != nil {
+		t.Fatal(err)
+	}
+	if got := compressedSizeForTest(t, st); got != 40 {
+		t.Fatalf("compressed size with shared output = %d, want 40", got)
+	}
+
+	entry1.OutputID = output2
+	entry1.CompressedSize = 60
+	if err := st.q.upsertEntry(context.Background(), entry1); err != nil {
+		t.Fatal(err)
+	}
+	if got := compressedSizeForTest(t, st); got != 100 {
+		t.Fatalf("compressed size after output change = %d, want 100", got)
+	}
+
+	if err := st.q.deleteEntriesByOutputID(context.Background(), output1); err != nil {
+		t.Fatal(err)
+	}
+	if got := compressedSizeForTest(t, st); got != 60 {
+		t.Fatalf("compressed size after shared output deletion = %d, want 60", got)
+	}
+	if err := st.q.deleteEntriesByOutputID(context.Background(), output2); err != nil {
+		t.Fatal(err)
+	}
+	if got := compressedSizeForTest(t, st); got != 0 {
+		t.Fatalf("compressed size after all output deletion = %d, want 0", got)
+	}
+}
+
+func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
+	cacheDir := t.TempDir()
+	const (
+		storeCount  = 8
+		putCount    = 200
+		outputCount = 16
+	)
+
+	stores := make([]*store, storeCount)
+	for i := range stores {
+		st, err := newStore(config{dir: cacheDir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = st
+		defer st.close()
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, storeCount)
+	var wg sync.WaitGroup
+	for worker, st := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := range putCount {
+				output := (worker*putCount + i) % outputCount
+				ent := entry{
+					ActionID:       fmt.Sprintf("%064x", worker*putCount+i+1),
+					OutputID:       fmt.Sprintf("%064x", output+1),
+					Size:           int64(output + 1),
+					CompressedSize: int64(output + 1),
+					CreatedAt:      time.Now(),
+					AccessedAt:     time.Now(),
+				}
+				if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	const want = outputCount * (outputCount + 1) / 2
+	if got := compressedSizeForTest(t, stores[0]); got != want {
+		t.Fatalf("compressed size = %d, want %d", got, want)
+	}
+	reconciled, err := stores[0].q.reconcileCompressedSize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled != want {
+		t.Fatalf("reconciled compressed size = %d, want %d", reconciled, want)
+	}
+}
+
+func TestCompressedSizeRejectsNegativeAdjustment(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	now := time.Now()
+	ent := entry{
+		ActionID:       strings.Repeat("a", 64),
+		OutputID:       strings.Repeat("1", 64),
+		Size:           100,
+		CompressedSize: 40,
+		CreatedAt:      now,
+		AccessedAt:     now,
+	}
+	if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.setState(context.Background(), compressedSizeStateKey, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.deleteEntriesByOutputID(context.Background(), ent.OutputID); err == nil {
+		t.Fatal("delete succeeded with an understated compressed-size counter")
+	}
+	if _, found, err := st.q.lookupEntry(context.Background(), ent.ActionID); err != nil {
+		t.Fatal(err)
+	} else if !found {
+		t.Fatal("failed accounting adjustment did not roll back entry deletion")
+	}
+}
+
+func TestFullPruneReconcilesCompressedSize(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{
+		dir:     t.TempDir(),
+		maxSize: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	addSizedCacheEntries(t, st, time.Now(), 2, 100)
+	if err := st.q.setState(context.Background(), compressedSizeStateKey, 1); err != nil {
+		t.Fatal(err)
+	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.pruneAutomatically(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := compressedSizeForTest(t, st); got != 200 {
+		t.Fatalf("reconciled compressed size = %d, want 200", got)
 	}
 }
 
@@ -2146,6 +2429,40 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "Compressed blob contents:\n")
 	assertContains(t, got, "None      0        0B      0B  0B (0.0%)")
 	assertContains(t, got, "Retained go-list files:\n")
+}
+
+func TestStatusDoesNotWaitForLifecycleLock(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	st, err := newStore(config{dir: cacheDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	lock := flock.New(st.lifecycleLockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close() //nolint:errcheck
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := readStatus(config{dir: cacheDir})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status waited for lifecycle lock")
+	}
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunStatusShowsEffectiveConfig(t *testing.T) {
@@ -3603,6 +3920,15 @@ func addSizedCacheEntries(t *testing.T, st *store, now time.Time, count int, siz
 	return outputIDs
 }
 
+func compressedSizeForTest(t *testing.T, st *store) int64 {
+	t.Helper()
+	size, err := st.compressedSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return size
+}
+
 func queryDB(t *testing.T, db *sqliteDB, query string, args []any, dest ...any) {
 	t.Helper()
 	found := false
@@ -3704,6 +4030,22 @@ type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write failed")
+}
+
+type removeFileReader struct {
+	reader  io.Reader
+	path    string
+	removed bool
+}
+
+func (r *removeFileReader) Read(p []byte) (int, error) {
+	if !r.removed {
+		r.removed = true
+		if err := os.Remove(r.path); err != nil {
+			return 0, err
+		}
+	}
+	return r.reader.Read(p)
 }
 
 func strconvQuote(s string) string {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"zombiezen.com/go/sqlite"
@@ -18,12 +17,23 @@ type sqliteDB struct {
 }
 
 func openDB(path string) (*sqliteDB, error) {
-	conns := min(max(runtime.GOMAXPROCS(0), 1), 8)
-	db, err := openSQLitePool(path, sqlite.OpenReadWrite|sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI, conns, true)
+	db, err := openSQLitePool(path, sqlite.OpenReadWrite|sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI, 2, true)
 	if err != nil {
 		return nil, err
 	}
 	if err := initDB(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func openWritableExistingDB(path string) (*sqliteDB, error) {
+	db, err := openSQLitePool(path, sqlite.OpenReadWrite|sqlite.OpenWAL|sqlite.OpenURI, 1, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDBVersion(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -35,22 +45,27 @@ func openExistingDB(path string) (*sqliteDB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateDBVersion(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
 
+func validateDBVersion(db *sqliteDB) error {
 	var version int64
-	err = db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+	err := db.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		var err error
 		version, err = queryInt64(conn, `PRAGMA user_version`, nil)
 		return err
 	})
 	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("read catalog version: %w", err)
+		return fmt.Errorf("read catalog version: %w", err)
 	}
 	if version != cacheSchemaVersion {
-		_ = db.Close()
-		return nil, fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
+		return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
 	}
-	return db, nil
+	return nil
 }
 
 func openSQLitePool(path string, flags sqlite.OpenFlags, size int, writable bool) (*sqliteDB, error) {
@@ -90,7 +105,10 @@ func (db *sqliteDB) withConn(ctx context.Context, fn func(*sqlite.Conn) error) e
 
 func (db *sqliteDB) withTx(ctx context.Context, fn func(*sqlite.Conn) error) error {
 	return db.withConn(ctx, func(conn *sqlite.Conn) error {
-		if err := sqlitex.Execute(conn, `BEGIN`, nil); err != nil {
+		// All current transactions write. Acquire the write lock before taking a
+		// read snapshot so concurrent helpers wait instead of failing with
+		// SQLITE_BUSY_SNAPSHOT when upgrading a deferred transaction.
+		if err := sqlitex.Execute(conn, `BEGIN IMMEDIATE`, nil); err != nil {
 			return err
 		}
 		if err := fn(conn); err != nil {
