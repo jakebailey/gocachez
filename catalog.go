@@ -109,7 +109,7 @@ func (c *catalog) countRuns(ctx context.Context) (int64, error) {
 	return count, err
 }
 
-func (c *catalog) state(ctx context.Context, key string) (int64, bool, error) {
+func (c *catalog) fullPruneState(ctx context.Context) (int64, bool, error) {
 	var value int64
 	var found bool
 	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
@@ -118,7 +118,7 @@ func (c *catalog) state(ctx context.Context, key string) (int64, bool, error) {
 SELECT value
 FROM state
 WHERE key = ?`, func(stmt *sqlite.Stmt) {
-			stmt.BindText(1, key)
+			stmt.BindText(1, lastFullPruneStateKey)
 		}, func(stmt *sqlite.Stmt) {
 			value = stmt.ColumnInt64(0)
 		})

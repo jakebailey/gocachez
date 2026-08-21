@@ -393,7 +393,7 @@ func isGoTestOutput(data []byte) bool {
 		[]byte("FAIL\t"),
 		[]byte("PASS\nok  \t"),
 		[]byte("PASS\n?   \t"),
-		[]byte("FAIL\nFAIL\t"),
+		append([]byte("FAIL\n"), []byte("FAIL\t")...),
 	}
 	for _, marker := range markers {
 		if bytes.HasPrefix(data, marker) || bytes.Contains(data, append([]byte("\n"), marker...)) {

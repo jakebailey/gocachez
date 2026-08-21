@@ -565,7 +565,7 @@ func (st *store) pruneSizeLocked(target int64) error {
 }
 
 func (st *store) fullPruneDue(now time.Time) (bool, error) {
-	lastMillis, found, err := st.q.state(context.Background(), lastFullPruneStateKey)
+	lastMillis, found, err := st.q.fullPruneState(context.Background())
 	if err != nil {
 		return false, fmt.Errorf("read last full prune: %w", err)
 	}

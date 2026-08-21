@@ -116,10 +116,6 @@ func installExportArchive(tmpPath, exportPath string) error {
 	return fmt.Errorf("install export archive: %w", err)
 }
 
-func replaceWithExportArchive(exportPath, path string) error {
-	return replaceWithExportArchiveWithFallback(exportPath, path, nil)
-}
-
 func replaceWithExportArchiveWithFallback(exportPath, path string, onCopyFallback func()) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".export-*")
 	if err != nil {
@@ -187,10 +183,6 @@ func replaceFile(tmpPath, path string) error {
 		return fmt.Errorf("replace live archive: %w", err)
 	}
 	return nil
-}
-
-func retainEscapedGeneratedGoSource(path, retainedPath string) (retainedTypeKind, bool, error) {
-	return retainEscapedGeneratedGoSourceWithFallback(path, retainedPath, nil)
 }
 
 func retainEscapedGeneratedGoSourceWithFallback(path, retainedPath string, onCopyFallback func()) (retainedTypeKind, bool, error) {

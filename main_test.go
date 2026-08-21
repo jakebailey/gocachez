@@ -1007,7 +1007,8 @@ func TestCloseRetainsGeneratedTestmainLiveFile(t *testing.T) {
 func TestCloseDoesNotRetainBinaryContainingCgoMarkers(t *testing.T) {
 	t.Parallel()
 
-	body := append([]byte{0x7f, 'E', 'L', 'F', 0}, []byte("package main\n"+generatedCgoDirective+"import_dynamic x x \"libc.so\"\n")...)
+	cgoPayload := "import_dynamic " + strings.Repeat("x ", 2) + "\"libc.so\"\n"
+	body := append([]byte{0x7f, 'E', 'L', 'F', 0}, []byte("package main\n"+generatedCgoDirective+cgoPayload)...)
 	cacheDir := t.TempDir()
 	st, err := newStore(config{dir: cacheDir})
 	if err != nil {
@@ -1038,7 +1039,8 @@ func TestGeneratedSourceClassificationUsesBoundedPrefix(t *testing.T) {
 	t.Parallel()
 
 	data := bytes.Repeat([]byte("x"), generatedSourcePrefixLimit)
-	data = append(data, []byte("\npackage main\n"+generatedCgoDirective+"import_dynamic x x \"libc.so\"\n")...)
+	cgoPayload := "import_dynamic " + strings.Repeat("x ", 2) + "\"libc.so\"\n"
+	data = append(data, []byte("\npackage main\n"+generatedCgoDirective+cgoPayload)...)
 	path := filepath.Join(t.TempDir(), "large")
 	if err := os.WriteFile(path, data, 0o666); err != nil {
 		t.Fatal(err)
@@ -1229,7 +1231,7 @@ func TestAutomaticPruneRunsFullPruneAfterInterval(t *testing.T) {
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("orphan blob stat err = %v, want not exist", err)
 	}
-	lastMillis, found, err := st.q.state(context.Background(), lastFullPruneStateKey)
+	lastMillis, found, err := st.q.fullPruneState(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1260,7 +1262,7 @@ func TestAutomaticPruneDoesNotRecordSkippedPrune(t *testing.T) {
 	if err := st1.pruneAutomatically(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := st1.q.state(context.Background(), lastFullPruneStateKey); err != nil || found {
+	if _, found, err := st1.q.fullPruneState(context.Background()); err != nil || found {
 		t.Fatalf("last full prune: found=%t, err=%v; want not found", found, err)
 	}
 }
@@ -1299,7 +1301,7 @@ func TestAutomaticPruneEnforcesSizeWithActiveRuns(t *testing.T) {
 	if err := st1.pruneAutomatically(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := st1.q.state(context.Background(), lastFullPruneStateKey); err != nil || found {
+	if _, found, err := st1.q.fullPruneState(context.Background()); err != nil || found {
 		t.Fatalf("last full prune: found=%t, err=%v; want not found", found, err)
 	}
 	if _, err := os.Stat(orphanPath); err != nil {
@@ -1495,9 +1497,7 @@ func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
 	errs := make(chan error, storeCount)
 	var wg sync.WaitGroup
 	for worker, st := range stores {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			for i := range putCount {
 				output := (worker*putCount + i) % outputCount
@@ -1514,7 +1514,7 @@ func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
