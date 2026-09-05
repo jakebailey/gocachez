@@ -551,6 +551,88 @@ func TestRejectsMismatchedDBVersion(t *testing.T) {
 	}
 }
 
+func TestSQLiteBusyWaitRespectsContext(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	lockConn, err := sqlite.OpenConn(dbPath, sqlite.OpenReadWrite|sqlite.OpenURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Close() //nolint:errcheck
+	if err := execute(lockConn, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer execute(lockConn, `ROLLBACK`) //nolint:errcheck
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = db.withConn(ctx, func(conn *sqlite.Conn) error {
+		return execute(conn, `
+INSERT INTO runs(run_id, path, lock_path, created_at)
+VALUES ('blocked', '', '', 0)`)
+	})
+	if code := sqlite.ErrCode(err).ToPrimary(); code != sqlite.ResultBusy {
+		t.Fatalf("write error = %v (code %v), want SQLITE_BUSY", err, code)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("write observed context cancellation after %v, want under 1s", elapsed)
+	}
+}
+
+func TestSQLiteBusyWaitsUntilLockReleased(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() //nolint:errcheck
+
+	lockConn, err := sqlite.OpenConn(dbPath, sqlite.OpenReadWrite|sqlite.OpenURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Close() //nolint:errcheck
+	if err := execute(lockConn, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+			return execute(conn, `
+INSERT INTO runs(run_id, path, lock_path, created_at)
+VALUES ('blocked', '', '', 0)`)
+		})
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("write returned while database was locked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := execute(lockConn, `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write remained blocked after database lock was released")
+	}
+}
+
 func TestReclaimsAbandonedUnlockedRun(t *testing.T) {
 	t.Parallel()
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
-	"time"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -70,11 +69,30 @@ func validateDBVersion(db *sqliteDB) error {
 
 func openSQLitePool(path string, flags sqlite.OpenFlags, size int, writable bool) (*sqliteDB, error) {
 	dsn := "file:" + url.PathEscape(filepath.ToSlash(path))
+	if flags&sqlite.OpenWAL != 0 {
+		flags &^= sqlite.OpenWAL
+		conn, err := sqlite.OpenConn(dsn, flags)
+		if err != nil {
+			return nil, fmt.Errorf("open catalog for WAL: %w", err)
+		}
+		conn.SetBlockOnBusy()
+		walErr := sqlitex.Execute(conn, `PRAGMA journal_mode = WAL`, nil)
+		closeErr := conn.Close()
+		if walErr != nil {
+			walErr = fmt.Errorf("enable catalog WAL: %w", walErr)
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("close catalog WAL connection: %w", closeErr)
+		}
+		if err := errors.Join(walErr, closeErr); err != nil {
+			return nil, err
+		}
+	}
 	pool, err := sqlitex.NewPool(dsn, sqlitex.PoolOptions{
 		Flags:    flags,
 		PoolSize: size,
 		PrepareConn: func(conn *sqlite.Conn) error {
-			conn.SetBusyTimeout(5 * time.Second)
+			conn.SetBlockOnBusy()
 			if !writable {
 				return nil
 			}
