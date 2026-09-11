@@ -21,7 +21,7 @@ const blobTypePrefixLimit = 64 << 10
 // classifications are stored with the version that produced them (see
 // entries.blob_type_version); bump this whenever the classification logic
 // changes so status ignores and recomputes stale cached values.
-const blobClassifierVersion = 2
+const blobClassifierVersion = 3
 
 type blobTypeKind int
 
@@ -52,6 +52,7 @@ const (
 	blobTypeUnknownBinary
 	blobTypeUnreadable
 	blobTypeGoIndexedExportData
+	blobTypeGoCoverageMetadata
 )
 
 type blobTypeStatus struct {
@@ -287,6 +288,9 @@ func classifyBlobData(data []byte) blobClassification {
 	if isGoCoverageProfile(data) {
 		return blobClassification{kind: blobTypeGoCoverageProfile}
 	}
+	if isGoCoverageMetadata(data) {
+		return blobClassification{kind: blobTypeGoCoverageMetadata}
+	}
 	if isGoToolOutput(data) {
 		return blobClassification{kind: blobTypeGoToolOutput}
 	}
@@ -421,6 +425,10 @@ func isGoCoverageProfile(data []byte) bool {
 		bytes.Equal(line, []byte("mode: atomic"))
 }
 
+func isGoCoverageMetadata(data []byte) bool {
+	return bytes.HasPrefix(data, []byte{0x00, 'c', 'v', 'm'})
+}
+
 func isGoToolOutput(data []byte) bool {
 	line, _, ok := bytes.Cut(data, []byte("\n"))
 	if !ok || !bytes.HasPrefix(line, []byte("# ")) || bytes.Equal(line, []byte("# test log")) {
@@ -525,6 +533,8 @@ func (kind blobTypeKind) label() string {
 		return "Unreadable blobs"
 	case blobTypeGoIndexedExportData:
 		return "Go indexed export data"
+	case blobTypeGoCoverageMetadata:
+		return "Go coverage metadata"
 	default:
 		return "Unknown files"
 	}

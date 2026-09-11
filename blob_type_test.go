@@ -128,6 +128,15 @@ func TestClassifyBlobDataRecognizesIndexedExportData(t *testing.T) {
 	}
 }
 
+func TestClassifyBlobDataRecognizesCoverageMetadata(t *testing.T) {
+	t.Parallel()
+
+	classification := classifyBlobData([]byte{0x00, 'c', 'v', 'm', 1, 0, 0, 0})
+	if classification.kind != blobTypeGoCoverageMetadata {
+		t.Fatalf("classification = %v, want %v", classification.kind, blobTypeGoCoverageMetadata)
+	}
+}
+
 func writeCompressedTestBlob(t *testing.T, path string, body []byte) {
 	t.Helper()
 

@@ -2728,6 +2728,7 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 		{67, 68, []byte{0x7f, 'E', 'L', 'F', 1, 2, 3}},
 		{71, 72, []byte("go index v2\n\x00\x01\x02")},
 		{73, 74, compilerID},
+		{75, 76, []byte{0x00, 'c', 'v', 'm', 1, 0, 0, 0}},
 	}
 	for _, entry := range entries {
 		if _, err := st.put(request{
@@ -2754,6 +2755,7 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 	assertContains(t, got, "Generated cgo sources")
 	assertContains(t, got, "ELF binaries")
 	assertContains(t, got, "C compiler IDs")
+	assertContains(t, got, "Go coverage metadata")
 }
 
 func TestRunStatusShowsRetainedFileTypes(t *testing.T) {
