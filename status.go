@@ -48,7 +48,7 @@ type retainedTypeKind int
 
 // retainedClassifierVersion identifies the behavior of retainedFileKind. Cached
 // values use this version so classification changes can invalidate them.
-const retainedClassifierVersion = 1
+const retainedClassifierVersion = 2
 
 // retainedTypeKind values are persisted in entries.retained_type. Existing
 // values must not be renumbered; append new kinds at the end.
@@ -57,6 +57,7 @@ const (
 	retainedTypeGeneratedCgoSource
 	retainedTypeGeneratedTestmain
 	retainedTypeOther
+	retainedTypeIndexedExportData
 )
 
 type retainedTypeStatus struct {
@@ -533,8 +534,10 @@ func retainedFileKind(path string) retainedTypeKind {
 	switch filepath.Ext(path) {
 	case ".a":
 		return retainedTypeExportArchive
+	case ".i":
+		return retainedTypeIndexedExportData
 	case ".go":
-		data, err := readFilePrefix(path, generatedSourcePrefixLimit)
+		data, err := readFilePrefix(path)
 		if err != nil {
 			return retainedTypeOther
 		}
@@ -590,6 +593,8 @@ func (kind retainedTypeKind) label() string {
 		return "Generated cgo sources"
 	case retainedTypeGeneratedTestmain:
 		return "Generated test mains"
+	case retainedTypeIndexedExportData:
+		return "Indexed export data"
 	default:
 		return "Other retained files"
 	}

@@ -119,6 +119,15 @@ func TestClassifyBlobDataRecognizesGoCacheTextFormats(t *testing.T) {
 	}
 }
 
+func TestClassifyBlobDataRecognizesIndexedExportData(t *testing.T) {
+	t.Parallel()
+
+	classification := classifyBlobData(indexedExportData(t))
+	if classification.kind != blobTypeGoIndexedExportData {
+		t.Fatalf("classification = %v, want %v", classification.kind, blobTypeGoIndexedExportData)
+	}
+}
+
 func writeCompressedTestBlob(t *testing.T, path string, body []byte) {
 	t.Helper()
 

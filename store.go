@@ -361,6 +361,14 @@ func (st *store) prepareLiveRunForClose() (bool, error) {
 			retained = true
 			continue
 		}
+		indexed, err := st.retainLiveIndexedExportData(path)
+		if err != nil {
+			return false, err
+		}
+		if indexed {
+			retained = true
+			continue
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, fmt.Errorf("remove live file: %w", err)
 		}
@@ -395,6 +403,28 @@ func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
 		return retained, err
 	}
 	if err := st.q.updateRetainedType(context.Background(), outputID, kind); err != nil {
+		if st.verbose {
+			log.Printf("gocachez: cache retained file type failed: %v", err)
+		}
+	}
+	return true, nil
+}
+
+func (st *store) retainLiveIndexedExportData(path string) (bool, error) {
+	outputID := liveOutputID(path)
+	if outputID == "" {
+		return false, nil
+	}
+	onCopyFallback := func() {
+		if st.verbose {
+			log.Printf("gocachez: hard link unavailable for retained file %s; copying instead", outputID)
+		}
+	}
+	retained, err := retainEscapedIndexedExportDataWithFallback(path, st.retainedPath(outputID, ".i"), onCopyFallback)
+	if err != nil || !retained {
+		return retained, err
+	}
+	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeIndexedExportData); err != nil {
 		if st.verbose {
 			log.Printf("gocachez: cache retained file type failed: %v", err)
 		}

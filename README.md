@@ -105,10 +105,11 @@ paths in `CompiledGoFiles`, and `go list -test` can report a generated
 
 To support those tools without keeping large uncompressed archives around,
 `gocachez` treats these escaped files specially on close. Package archives are
-replaced with small archives containing only their `__.PKGDEF` export data, and
-generated Go source files that can appear in list output are retained as-is.
-These retained files are stored under `retained/`, keyed by output ID, and are
-cleaned up once no catalog entry references that output.
+replaced with small archives containing only their `__.PKGDEF` export data.
+Standalone indexed export data and generated Go source files that can appear in
+list output are retained as-is. These retained files are stored under
+`retained/`, keyed by output ID, and are cleaned up once no catalog entry
+references that output.
 
 ## Configuration
 

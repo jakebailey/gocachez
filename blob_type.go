@@ -21,7 +21,7 @@ const blobTypePrefixLimit = 64 << 10
 // classifications are stored with the version that produced them (see
 // entries.blob_type_version); bump this whenever the classification logic
 // changes so status ignores and recomputes stale cached values.
-const blobClassifierVersion = 1
+const blobClassifierVersion = 2
 
 type blobTypeKind int
 
@@ -51,6 +51,7 @@ const (
 	blobTypeEmpty
 	blobTypeUnknownBinary
 	blobTypeUnreadable
+	blobTypeGoIndexedExportData
 )
 
 type blobTypeStatus struct {
@@ -246,6 +247,9 @@ func classifyBlobData(data []byte) blobClassification {
 	}
 	if _, ok := packageArchiveExportSize(data); ok {
 		return blobClassification{kind: blobTypeGoPackageArchive}
+	}
+	if isIndexedExportData(data) {
+		return blobClassification{kind: blobTypeGoIndexedExportData}
 	}
 	if bytes.HasPrefix(data, []byte("go index v")) {
 		return blobClassification{kind: blobTypeGoPackageIndex}
@@ -519,6 +523,8 @@ func (kind blobTypeKind) label() string {
 		return "Unknown binary files"
 	case blobTypeUnreadable:
 		return "Unreadable blobs"
+	case blobTypeGoIndexedExportData:
+		return "Go indexed export data"
 	default:
 		return "Unknown files"
 	}
