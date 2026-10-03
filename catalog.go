@@ -373,7 +373,9 @@ func updateRetainedType(conn *sqlite.Conn, outputID string, kind retainedTypeKin
 	return execute(conn, `
 UPDATE entries
 SET retained_type = ?, retained_type_version = ?
-WHERE output_id = ?`, int64(kind), retainedClassifierVersion, outputID)
+WHERE output_id = ?
+	AND (retained_type IS NOT ? OR retained_type_version IS NOT ?)`,
+		int64(kind), retainedClassifierVersion, outputID, int64(kind), retainedClassifierVersion)
 }
 
 func entriesHasColumn(conn *sqlite.Conn, column string) (bool, error) {

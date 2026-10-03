@@ -1754,36 +1754,7 @@ func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
 func BenchmarkUpsertEntrySharedOutput(b *testing.B) {
 	for _, actions := range []int{1, 75000} {
 		b.Run(fmt.Sprintf("actions=%d", actions), func(b *testing.B) {
-			st, err := newStore(config{dir: b.TempDir()})
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer st.close()
-
-			now := time.Now()
-			ent := entry{
-				ActionID:       fmt.Sprintf("%064x", 1),
-				OutputID:       hexOf(sha256Sum(nil)),
-				CompressedSize: 13,
-				CreatedAt:      now,
-				AccessedAt:     now,
-			}
-			if err := st.q.upsertEntry(context.Background(), ent); err != nil {
-				b.Fatal(err)
-			}
-			if err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
-				return execute(conn, `
-WITH RECURSIVE actions(n) AS (
-	SELECT 2 WHERE ? >= 2
-	UNION ALL
-	SELECT n + 1 FROM actions WHERE n < ?
-)
-INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-SELECT printf('%064x', n), ?, 0, 13, ?, ? FROM actions`,
-					actions, actions, ent.OutputID, unixMillis(now), unixMillis(now))
-			}); err != nil {
-				b.Fatal(err)
-			}
+			st, ent := benchmarkSharedOutputStore(b, actions)
 
 			b.ResetTimer()
 			for range b.N {
@@ -1801,6 +1772,57 @@ SELECT printf('%064x', n), ?, 0, 13, ?, ? FROM actions`,
 			}
 		})
 	}
+}
+
+func BenchmarkUpdateRetainedTypeUnchanged(b *testing.B) {
+	for _, actions := range []int{84, 1000} {
+		b.Run(fmt.Sprintf("actions=%d", actions), func(b *testing.B) {
+			st, ent := benchmarkSharedOutputStore(b, actions)
+			if err := st.q.updateRetainedType(context.Background(), ent.OutputID, retainedTypeExportArchive); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for range b.N {
+				if err := st.q.updateRetainedType(context.Background(), ent.OutputID, retainedTypeExportArchive); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func benchmarkSharedOutputStore(b *testing.B, actions int) (*store, entry) {
+	b.Helper()
+	st, err := newStore(config{dir: b.TempDir()})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(st.close)
+	now := time.Now()
+	ent := entry{
+		ActionID:       fmt.Sprintf("%064x", 1),
+		OutputID:       hexOf(sha256Sum(nil)),
+		CompressedSize: 13,
+		CreatedAt:      now,
+		AccessedAt:     now,
+	}
+	if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+		b.Fatal(err)
+	}
+	if err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
+		return execute(conn, `
+WITH RECURSIVE actions(n) AS (
+	SELECT 2 WHERE ? >= 2
+	UNION ALL
+	SELECT n + 1 FROM actions WHERE n < ?
+)
+INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
+SELECT printf('%064x', n), ?, 0, 13, ?, ? FROM actions`,
+			actions, actions, ent.OutputID, unixMillis(now), unixMillis(now))
+	}); err != nil {
+		b.Fatal(err)
+	}
+	return st, ent
 }
 
 func TestCompressedSizeRejectsNegativeAdjustment(t *testing.T) {
@@ -3183,6 +3205,79 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	}
 	if !retainedType.ok || retainedTypeKind(retainedType.value) != retainedTypeGeneratedCgoSource {
 		t.Fatalf("retained_type = %v after same-output re-put, want %d", retainedType, retainedTypeGeneratedCgoSource)
+	}
+}
+
+func TestUpdateRetainedTypeSkipsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	outputID := hexOf(sha256Sum(nil))
+	now := time.Now()
+	for i := range 5 {
+		if err := st.upsertEntry(entry{
+			ActionID:       fmt.Sprintf("%064x", i+1),
+			OutputID:       outputID,
+			CompressedSize: 13,
+			CreatedAt:      now,
+			AccessedAt:     now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, classification := range []struct {
+		kind    retainedTypeKind
+		version any
+	}{
+		{retainedTypeExportArchive, retainedClassifierVersion},
+		{retainedTypeGeneratedCgoSource, retainedClassifierVersion},
+		{retainedTypeExportArchive, retainedClassifierVersion - 1},
+		{retainedTypeExportArchive, nil},
+	} {
+		execDB(t, st.db, `UPDATE entries SET retained_type = ?, retained_type_version = ? WHERE action_id = ?`,
+			int64(classification.kind), classification.version, fmt.Sprintf("%064x", i+1))
+	}
+	if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		return sqlitex.ExecuteScript(conn, `
+CREATE TABLE retained_updates(action_id TEXT);
+CREATE TRIGGER log_retained_update AFTER UPDATE OF retained_type, retained_type_version ON entries
+BEGIN
+	INSERT INTO retained_updates VALUES (NEW.action_id);
+END;`, nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
+		t.Fatal(err)
+	}
+	var updates, classified int64
+	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
+	if updates != 4 {
+		t.Fatalf("classification updates = %d, want 4 changed or missing classifications", updates)
+	}
+	queryDB(t, st.db, `SELECT COUNT(*) FROM entries WHERE retained_type = ? AND retained_type_version = ?`,
+		[]any{int64(retainedTypeExportArchive), retainedClassifierVersion}, &classified)
+	if classified != 5 {
+		t.Fatalf("classified entries = %d, want 5", classified)
+	}
+	execDB(t, st.db, `DELETE FROM retained_updates`)
+	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
+		t.Fatal(err)
+	}
+	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
+	if updates != 0 {
+		t.Fatalf("unchanged classification updates = %d, want 0", updates)
+	}
+	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeIndexedExportData); err != nil {
+		t.Fatal(err)
+	}
+	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
+	if updates != 5 {
+		t.Fatalf("changed classification updates = %d, want 5", updates)
 	}
 }
 
