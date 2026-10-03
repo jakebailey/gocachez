@@ -88,7 +88,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	}()
 
 	var bodyFile *os.File
-	var bodyWriter io.Writer = io.Discard
+	bodyWriter := io.Discard
 	if !keepBody {
 		bodyFile, err = os.Create(bodyPath)
 		if err != nil {
