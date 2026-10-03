@@ -1355,107 +1355,133 @@ func BenchmarkReuseRetainedFiles(b *testing.B) {
 func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	t.Parallel()
 
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir:     cacheDir,
-		maxSize: 0,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	for _, tt := range retainedFileCases(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cacheDir := t.TempDir()
+			st, err := newStore(config{dir: cacheDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outputID := bytes.Repeat([]byte{62}, 32)
+			referencedID := bytes.Repeat([]byte{63}, 32)
+			for i, id := range [][]byte{outputID, referencedID} {
+				if _, err := st.put(request{
+					ID:       int64(i + 1),
+					Command:  cmdPut,
+					ActionID: bytes.Repeat([]byte{byte(61 + i)}, 32),
+					OutputID: id,
+					BodySize: int64(len(tt.body)),
+				}, bufio.NewReader(encodedBody(tt.body))); err != nil {
+					st.close()
+					t.Fatal(err)
+				}
+			}
+			st.close()
 
-	exportData := []byte("uFAKE")
-	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
-	actionID := bytes.Repeat([]byte{61}, 32)
-	outputID := bytes.Repeat([]byte{62}, 32)
-	if _, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	st, err = newStore(config{
-		dir:     cacheDir,
-		maxSize: 0,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	exportPath := retainedPath(cacheDir, outputID, ".a")
-	if _, err := os.Stat(exportPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
-		t.Fatal(err)
-	}
-	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
-	if err := st.prune(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(exportPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan retained export stat err = %v, want not exist", err)
+			st, err = newStore(config{dir: cacheDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.close()
+			path := retainedPath(cacheDir, outputID, tt.ext)
+			if _, err := os.Stat(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
+				t.Fatal(err)
+			}
+			execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+			if err := st.prune(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("orphan retained file stat err = %v, want not exist", err)
+			}
+			if _, err := os.Stat(retainedPath(cacheDir, referencedID, tt.ext)); err != nil {
+				t.Fatalf("referenced retained file was removed: %v", err)
+			}
+		})
 	}
 }
 
 func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
 	t.Parallel()
 
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
+	for _, tt := range retainedFileCases(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cacheDir := t.TempDir()
+			st, err := newStore(config{dir: cacheDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outputID := bytes.Repeat([]byte{64}, 32)
+			res, err := st.put(request{
+				ID:       1,
+				Command:  cmdPut,
+				ActionID: bytes.Repeat([]byte{63}, 32),
+				OutputID: outputID,
+				BodySize: int64(len(tt.body)),
+			}, bufio.NewReader(encodedBody(tt.body)))
+			if err != nil {
+				st.close()
+				t.Fatal(err)
+			}
+			st.close()
+			path := retainedPath(cacheDir, outputID, tt.ext)
+			old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+			for _, agedPath := range []string{path, filepath.Join(filepath.Dir(res.DiskPath), "run.lock")} {
+				if err := os.Chtimes(agedPath, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			st, err = newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.close()
+			execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+			if err := st.prune(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("old retained file stat err = %v, want not exist", err)
+			}
+			if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
+				t.Fatalf("old retained live file stat err = %v, want not exist", err)
+			}
+		})
 	}
+}
 
-	exportData := []byte("uFAKE")
-	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
-	actionID := bytes.Repeat([]byte{63}, 32)
-	outputID := bytes.Repeat([]byte{64}, 32)
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
+func TestRetainedAgePruneCanBeDisabled(t *testing.T) {
+	t.Parallel()
 
-	exportPath := retainedPath(cacheDir, outputID, ".a")
-	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-	for _, path := range []string{exportPath, filepath.Join(filepath.Dir(res.DiskPath), "run.lock")} {
-		if err := os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	st, err = newStore(config{
-		dir:    cacheDir,
-		maxAge: defaultMaxAge,
-	})
+	st, err := newStore(config{dir: t.TempDir(), maxAge: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.close()
-	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
-	if err := st.prune(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(exportPath); !os.IsNotExist(err) {
-		t.Fatalf("old retained export stat err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
-		t.Fatalf("old retained live file stat err = %v, want not exist", err)
+	outputID := strings.Repeat("a", 64)
+	for _, tt := range retainedFileCases(t) {
+		path := st.retainedPath(outputID, tt.ext)
+		if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, tt.body, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-2 * defaultMaxAge)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("age prune removed %s with maxAge disabled: %v", tt.ext, err)
+		}
 	}
 }
 
@@ -1523,15 +1549,7 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 	t.Parallel()
 
-	for _, tt := range []struct {
-		name string
-		ext  string
-		body []byte
-	}{
-		{"archive", ".a", goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))},
-		{"source", ".go", []byte(generatedTestmainSourcePrefix + "\nfunc main() {}\n")},
-		{"indexed", ".i", indexedExportData(t)},
-	} {
+	for _, tt := range retainedFileCases(t) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			cacheDir := t.TempDir()
@@ -4696,6 +4714,21 @@ func goArchive(pkgdef, object []byte) []byte {
 	writeArchiveMember(&buf, pkgdefName, pkgdef)
 	writeArchiveMember(&buf, "_go_.o", object)
 	return buf.Bytes()
+}
+
+type retainedFileCase struct {
+	name string
+	ext  string
+	body []byte
+}
+
+func retainedFileCases(t *testing.T) []retainedFileCase {
+	t.Helper()
+	return []retainedFileCase{
+		{"archive", ".a", goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))},
+		{"source", ".go", []byte(generatedTestmainSourcePrefix + "\nfunc main() {}\n")},
+		{"indexed", ".i", indexedExportData(t)},
+	}
 }
 
 func indexedExportData(t *testing.T) []byte {

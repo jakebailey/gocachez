@@ -696,7 +696,7 @@ func (st *store) pruneOldRetainedFiles(now time.Time) error {
 			return fmt.Errorf("read retained shard: %w", err)
 		}
 		for _, file := range files {
-			if file.IsDir() || (!strings.HasSuffix(file.Name(), ".a") && !strings.HasSuffix(file.Name(), ".go")) {
+			if file.IsDir() || !slices.Contains(retainedFileExtensions, filepath.Ext(file.Name())) {
 				continue
 			}
 			info, err := file.Info()
@@ -820,7 +820,7 @@ func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
 				return fmt.Errorf("remove orphan blobs in shard %s: %w", lower, err)
 			}
 		}
-		if err := removeOrphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), lower), referenced, ".a", ".go"); err != nil {
+		if err := removeOrphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), lower), referenced, retainedFileExtensions...); err != nil {
 			return fmt.Errorf("remove orphan retained files in shard %s: %w", lower, err)
 		}
 	}

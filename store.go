@@ -79,6 +79,8 @@ type store struct {
 
 const retainedDirName = "retained"
 
+var retainedFileExtensions = []string{".a", ".go", ".i"}
+
 func newStore(cfg config) (*store, error) {
 	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if err := os.MkdirAll(versionDir, 0o777); err != nil {
