@@ -22,6 +22,12 @@ import (
 
 var errInvalidCacheEntry = errors.New("invalid cache entry")
 
+type materialization struct {
+	done chan struct{}
+	path string
+	err  error
+}
+
 const (
 	// mtimeInterval mirrors cmd/go's DiskCache: retained-file mtimes are updated
 	// at most once per interval to avoid churn. The age cutoff itself is the
@@ -219,19 +225,15 @@ func (st *store) get(req request) (response, error) {
 		return response{}, err
 	}
 
-	path := st.getMaterialized(ent.OutputID)
-	if path == "" || !regularFile(path) {
-		path, err = st.materialize(ent)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidCacheEntry) {
-				if deleteErr := st.deleteOutput(ent.OutputID); deleteErr != nil && st.verbose {
-					log.Printf("gocachez: delete bad cache output failed: %v", deleteErr)
-				}
-				return response{ID: req.ID, Miss: true}, nil
+	path, err := st.getOrMaterialize(ent)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidCacheEntry) {
+			if deleteErr := st.deleteOutput(ent.OutputID); deleteErr != nil && st.verbose {
+				log.Printf("gocachez: delete bad cache output failed: %v", deleteErr)
 			}
-			return response{}, err
+			return response{ID: req.ID, Miss: true}, nil
 		}
-		st.setMaterialized(ent.OutputID, path)
+		return response{}, err
 	}
 
 	st.markEntryAccess(actionHex)
@@ -249,10 +251,40 @@ func (st *store) get(req request) (response, error) {
 	}, nil
 }
 
-func (st *store) getMaterialized(outputID string) string {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.materialized[outputID]
+func (st *store) getOrMaterialize(ent entry) (string, error) {
+	for {
+		st.mu.Lock()
+		path := st.materialized[ent.OutputID]
+		pending := st.materializing[ent.OutputID]
+		st.mu.Unlock()
+		if pending != nil {
+			<-pending.done
+			return pending.path, pending.err
+		}
+		if path != "" && regularFile(path) {
+			return path, nil
+		}
+
+		st.mu.Lock()
+		if st.materialized[ent.OutputID] != path || st.materializing[ent.OutputID] != nil {
+			st.mu.Unlock()
+			continue
+		}
+		pending = &materialization{done: make(chan struct{})}
+		st.materializing[ent.OutputID] = pending
+		st.mu.Unlock()
+
+		path, err := st.materialize(ent)
+		st.mu.Lock()
+		if err == nil {
+			st.materialized[ent.OutputID] = path
+		}
+		pending.path, pending.err = path, err
+		delete(st.materializing, ent.OutputID)
+		close(pending.done)
+		st.mu.Unlock()
+		return path, err
+	}
 }
 
 func (st *store) setMaterialized(outputID, path string) {

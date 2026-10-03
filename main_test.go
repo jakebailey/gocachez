@@ -153,6 +153,78 @@ func TestGetMaterializesAfterLiveFileRemoved(t *testing.T) {
 	}
 }
 
+func TestConcurrentGetsMaterializeOnce(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+
+	body := bytes.Repeat([]byte("shared artifact\n"), 1<<20)
+	actionID := sha256Sum([]byte("shared action"))
+	res, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: sha256Sum(body),
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(res.DiskPath); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 8
+	type result struct {
+		res response
+		err error
+	}
+	results := make(chan result, workers)
+	start := make(chan struct{})
+	for i := range workers {
+		go func() {
+			<-start
+			res, err := st.get(request{ID: int64(i + 2), Command: cmdGet, ActionID: actionID})
+			results <- result{res, err}
+		}()
+	}
+	close(start)
+	paths := make(map[string]struct{})
+	for range workers {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.res.Miss {
+			t.Fatal("concurrent get missed")
+		}
+		paths[got.res.DiskPath] = struct{}{}
+	}
+	if len(paths) != 1 {
+		t.Fatalf("concurrent gets created %d materializations, want 1", len(paths))
+	}
+	files, err := os.ReadDir(st.runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("live run contains %d files, want one artifact and run.lock", len(files))
+	}
+	for path := range paths {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatal("materialized body differs from cached artifact")
+		}
+	}
+}
+
 func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 	t.Parallel()
 
@@ -3690,6 +3762,36 @@ func TestCorruptBlobIsCacheMiss(t *testing.T) {
 	}
 	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
 		t.Fatalf("blob stat err = %v, want not exist", err)
+	}
+	if len(st.materializing) != 0 {
+		t.Fatal("failed materialization remains in flight")
+	}
+	res, err = st.put(request{
+		ID:       3,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(res.DiskPath); err != nil {
+		t.Fatal(err)
+	}
+	res, err = st.get(request{ID: 4, Command: cmdGet, ActionID: actionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Miss {
+		t.Fatal("get missed after replacing corrupt blob")
+	}
+	got, err := os.ReadFile(res.DiskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("retried materialization = %q, want %q", got, body)
 	}
 }
 

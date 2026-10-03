@@ -72,6 +72,7 @@ type store struct {
 	encoderPool       sync.Pool
 	decoderPool       sync.Pool
 	materialized      map[string]string
+	materializing     map[string]*materialization
 	accessed          map[string]int64
 	lastAccessFlush   time.Time
 }
@@ -153,6 +154,7 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		runDir:            runDir,
 		runLock:           runLock,
 		materialized:      make(map[string]string),
+		materializing:     make(map[string]*materialization),
 		accessed:          make(map[string]int64),
 		lastAccessFlush:   time.Now(),
 	}
