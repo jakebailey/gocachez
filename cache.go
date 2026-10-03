@@ -510,9 +510,6 @@ func (st *store) prune() error {
 		if err := st.pruneOldDataLocked(time.Now()); err != nil {
 			return err
 		}
-		if _, err := st.q.reconcileCompressedSize(context.Background()); err != nil {
-			return fmt.Errorf("reconcile compressed size: %w", err)
-		}
 		if err := st.pruneSizeLocked(st.maxSize); err != nil {
 			return err
 		}
@@ -540,9 +537,6 @@ func (st *store) pruneAutomatically(now time.Time) error {
 		}
 		if err := st.pruneOldDataLocked(now); err != nil {
 			return err
-		}
-		if _, err := st.q.reconcileCompressedSize(context.Background()); err != nil {
-			return fmt.Errorf("reconcile compressed size: %w", err)
 		}
 		if err := st.pruneSizeWithHysteresis(); err != nil {
 			return err
@@ -580,7 +574,14 @@ func (st *store) pruneOldDataLocked(now time.Time) error {
 	if err := st.pruneOldRetainedLiveDirs(now); err != nil {
 		return err
 	}
-	return st.pruneOldEntries(now)
+	// Age-based entry deletion reconciles size in the same transaction.
+	if st.maxAge > 0 {
+		return st.pruneOldEntries(now)
+	}
+	if _, err := st.q.reconcileCompressedSize(context.Background()); err != nil {
+		return fmt.Errorf("reconcile compressed size: %w", err)
+	}
+	return nil
 }
 
 func (st *store) pruneSizeLocked(target int64) error {

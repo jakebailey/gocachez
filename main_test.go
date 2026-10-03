@@ -2252,28 +2252,110 @@ func TestCompressedSizeRejectsNegativeAdjustment(t *testing.T) {
 func TestFullPruneReconcilesCompressedSize(t *testing.T) {
 	t.Parallel()
 
-	st, err := newStore(config{
-		dir:     t.TempDir(),
-		maxSize: 1000,
-	})
-	if err != nil {
-		t.Fatal(err)
+	for _, mode := range []struct {
+		name  string
+		prune func(*store, time.Time) error
+	}{
+		{"explicit", func(st *store, _ time.Time) error { return st.prune() }},
+		{"automatic", (*store).pruneAutomatically},
+	} {
+		for _, maxAge := range []time.Duration{0, defaultMaxAge} {
+			for _, expired := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/age=%s/expired=%t", mode.name, maxAge, expired), func(t *testing.T) {
+					t.Parallel()
+					st, err := newStore(config{
+						dir:     t.TempDir(),
+						maxSize: 1000,
+						maxAge:  maxAge,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer st.close()
+					now := time.Now()
+					outputs := addSizedCacheEntries(t, st, now, 2, 100)
+					wantSize := int64(200)
+					wantEntries := int64(2)
+					if expired {
+						old := trimCutoff(defaultMaxAge, now).Add(-time.Minute)
+						execDB(t, st.db, `UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
+							unixMillis(old), fmt.Sprintf("%064x", 1))
+						if err := st.upsertEntry(entry{
+							ActionID:       fmt.Sprintf("%064x", 3),
+							OutputID:       outputs[1],
+							Size:           100,
+							CompressedSize: 100,
+							CreatedAt:      old,
+							AccessedAt:     old,
+						}); err != nil {
+							t.Fatal(err)
+						}
+						wantEntries = 3
+						if maxAge > 0 {
+							wantSize, wantEntries = 100, 1
+						}
+					}
+					if err := st.q.setState(context.Background(), compressedSizeStateKey, 1); err != nil {
+						t.Fatal(err)
+					}
+					execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+					if err := st.q.setState(context.Background(), lastFullPruneStateKey, 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+						return sqlitex.ExecuteScript(conn, `
+CREATE TABLE size_reconciliations(value INTEGER);
+CREATE TRIGGER log_size_reconciliation AFTER UPDATE OF value ON state
+WHEN NEW.key = 'compressed-size'
+BEGIN
+	INSERT INTO size_reconciliations VALUES (NEW.value);
+END;`, nil)
+					}); err != nil {
+						t.Fatal(err)
+					}
+					if err := mode.prune(st, now); err != nil {
+						t.Fatal(err)
+					}
+					if got := compressedSizeForTest(t, st); got != wantSize {
+						t.Fatalf("reconciled compressed size = %d, want %d", got, wantSize)
+					}
+					var reconciliations, entries int64
+					queryDB(t, st.db, `SELECT COUNT(*) FROM size_reconciliations`, nil, &reconciliations)
+					if reconciliations != 1 {
+						t.Fatalf("full prune reconciled size %d times, want 1", reconciliations)
+					}
+					queryDB(t, st.db, `SELECT COUNT(*) FROM entries`, nil, &entries)
+					if entries != wantEntries {
+						t.Fatalf("remaining entries = %d, want %d", entries, wantEntries)
+					}
+					removed, err := st.q.deleteEntriesAccessedBefore(context.Background(), unixMillis(now.Add(defaultMaxAge)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if removed != wantEntries || compressedSizeForTest(t, st) != 0 {
+						t.Fatalf("direct age deletion did not reconcile size: removed=%d, want %d", removed, wantEntries)
+					}
+				})
+			}
+		}
 	}
-	defer st.close()
+}
 
-	addSizedCacheEntries(t, st, time.Now(), 2, 100)
-	if err := st.q.setState(context.Background(), compressedSizeStateKey, 1); err != nil {
-		t.Fatal(err)
-	}
-	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
-	if err := st.q.setState(context.Background(), lastFullPruneStateKey, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.pruneAutomatically(time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if got := compressedSizeForTest(t, st); got != 200 {
-		t.Fatalf("reconciled compressed size = %d, want 200", got)
+func BenchmarkFullPrune(b *testing.B) {
+	for _, actions := range []int{1, 75000} {
+		b.Run(fmt.Sprintf("actions=%d", actions), func(b *testing.B) {
+			st, _ := benchmarkSharedOutputStore(b, actions)
+			st.maxAge = defaultMaxAge
+			if err := st.q.deleteRun(context.Background(), st.runID); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for range b.N {
+				if err := st.prune(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
