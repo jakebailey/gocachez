@@ -44,7 +44,7 @@ const (
 
 var decoderOptions = []zstd.DOption{
 	zstd.WithDecoderConcurrency(1),
-	zstd.WithDecoderLowmem(true),
+	zstd.WithDecoderLowmem(false),
 }
 
 func (st *store) put(req request, br *bufio.Reader) (response, error) {

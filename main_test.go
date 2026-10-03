@@ -973,38 +973,38 @@ func TestEncoderAndDecoderPools(t *testing.T) {
 	}
 	defer st.close()
 
-	var compressed bytes.Buffer
-	enc, err := st.getEncoder(&compressed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := enc.Write([]byte("body")); err != nil {
-		t.Fatal(err)
-	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-	st.putEncoder(enc)
+	for _, body := range [][]byte{
+		[]byte("body"),
+		bytes.Repeat([]byte("pooled artifact\n"), 2<<20),
+		[]byte("again"),
+	} {
+		var compressed bytes.Buffer
+		enc, err := st.getEncoder(&compressed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := enc.Write(body); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		st.putEncoder(enc)
 
-	var compressedAgain bytes.Buffer
-	enc, err = st.getEncoder(&compressedAgain)
-	if err != nil {
-		t.Fatal(err)
+		dec, err := st.getDecoder(bytes.NewReader(compressed.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(dec)
+		st.putDecoder(dec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatalf("pooled decoder changed body: got %d bytes, want %d", len(got), len(body))
+		}
 	}
-	if _, err := enc.Write([]byte("again")); err != nil {
-		t.Fatal(err)
-	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-	st.putEncoder(enc)
-
-	dec, err := st.getDecoder(bytes.NewReader(compressed.Bytes()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.putDecoder(dec)
-	dec, err = st.getDecoder(strings.NewReader("not zstd"))
+	dec, err := st.getDecoder(strings.NewReader("not zstd"))
 	if err != nil {
 		t.Fatal(err)
 	}
