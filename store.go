@@ -237,8 +237,9 @@ func migrateSchema(conn *sqlite.Conn) error {
 			}
 		}
 	}
-	// Keep the status GROUP BY output_id scan covering as cached classifications
-	// are added to the schema.
+	// Put compressed_size immediately after output_id so per-output MAX queries
+	// seek to the maximum instead of scanning every action under the write lock.
+	// The remaining columns keep status queries covering.
 	current, err := statusCoverIndexCurrent(conn)
 	if err != nil {
 		return fmt.Errorf("inspect entries_output_cover index: %w", err)
@@ -247,7 +248,7 @@ func migrateSchema(conn *sqlite.Conn) error {
 		if err := execute(conn, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
 			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
 		}
-		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
+		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, compressed_size, size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
 			return fmt.Errorf("create entries_output_cover index: %w", err)
 		}
 	}
@@ -260,8 +261,8 @@ func migrateSchema(conn *sqlite.Conn) error {
 func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 	want := []string{
 		"output_id",
-		"size",
 		"compressed_size",
+		"size",
 		"blob_type",
 		"blob_type_version",
 		"retained_type",

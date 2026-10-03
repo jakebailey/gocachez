@@ -1679,6 +1679,58 @@ func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
 	}
 }
 
+func BenchmarkUpsertEntrySharedOutput(b *testing.B) {
+	for _, actions := range []int{1, 75000} {
+		b.Run(fmt.Sprintf("actions=%d", actions), func(b *testing.B) {
+			st, err := newStore(config{dir: b.TempDir()})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer st.close()
+
+			now := time.Now()
+			ent := entry{
+				ActionID:       fmt.Sprintf("%064x", 1),
+				OutputID:       hexOf(sha256Sum(nil)),
+				CompressedSize: 13,
+				CreatedAt:      now,
+				AccessedAt:     now,
+			}
+			if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+				b.Fatal(err)
+			}
+			if err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
+				return execute(conn, `
+WITH RECURSIVE actions(n) AS (
+	SELECT 2 WHERE ? >= 2
+	UNION ALL
+	SELECT n + 1 FROM actions WHERE n < ?
+)
+INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
+SELECT printf('%064x', n), ?, 0, 13, ?, ? FROM actions`,
+					actions, actions, ent.OutputID, unixMillis(now), unixMillis(now))
+			}); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ResetTimer()
+			for range b.N {
+				if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			size, err := st.compressedSize()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if size != ent.CompressedSize {
+				b.Fatalf("compressed size = %d, want %d", size, ent.CompressedSize)
+			}
+		})
+	}
+}
+
 func TestCompressedSizeRejectsNegativeAdjustment(t *testing.T) {
 	t.Parallel()
 
@@ -3124,6 +3176,97 @@ CREATE INDEX entries_output_id ON entries(output_id)`, nil); err != nil {
 		t.Fatal(err)
 	} else if has {
 		t.Fatal("entries_output_id present after migration")
+	}
+}
+
+func TestReopenCacheReordersOutputCoverIndex(t *testing.T) {
+	t.Parallel()
+
+	cfg := config{dir: t.TempDir()}
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("existing cache artifact")
+	actionID := sha256Sum([]byte("existing action"))
+	outputID := sha256Sum(body)
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
+		st.close()
+		t.Fatal(err)
+	}
+	original, found, err := st.lookupEntry(hexOf(actionID))
+	if err != nil || !found {
+		st.close()
+		t.Fatalf("lookup original entry: found=%t, err=%v", found, err)
+	}
+	execDB(t, st.db, `UPDATE entries SET blob_type = 7, blob_type_version = 3, retained_type = 4, retained_type_version = 2`)
+	if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		return sqlitex.ExecuteScript(conn, `
+DROP INDEX entries_output_cover;
+CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version);
+`, nil)
+	}); err != nil {
+		st.close()
+		t.Fatal(err)
+	}
+	st.close()
+
+	for attempt := range 2 {
+		st, err := newStore(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			defer st.close()
+			ent, found, err := st.lookupEntry(hexOf(actionID))
+			if err != nil || !found {
+				t.Fatalf("lookup migrated entry: found=%t, err=%v", found, err)
+			}
+			if ent != original {
+				t.Fatalf("migrated entry = %+v, want %+v", ent, original)
+			}
+			if got := compressedSizeForTest(t, st); got != original.CompressedSize {
+				t.Fatalf("compressed size = %d, want %d", got, original.CompressedSize)
+			}
+			var version, blobType, blobVersion, retainedType, retainedVersion int64
+			queryDB(t, st.db, `PRAGMA user_version`, nil, &version)
+			if version != 1 {
+				t.Fatalf("catalog version = %d, want existing version 1", version)
+			}
+			queryDB(t, st.db, `SELECT blob_type, blob_type_version, retained_type, retained_type_version FROM entries`, nil,
+				&blobType, &blobVersion, &retainedType, &retainedVersion)
+			if blobType != 7 || blobVersion != 3 || retainedType != 4 || retainedVersion != 2 {
+				t.Fatalf("classifications changed: %d/%d, %d/%d", blobType, blobVersion, retainedType, retainedVersion)
+			}
+			var columns string
+			queryDB(t, st.db, `SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno)`, nil, &columns)
+			if want := "output_id,compressed_size,size,blob_type,blob_type_version,retained_type,retained_type_version"; columns != want {
+				t.Fatalf("covering index columns = %q, want %q", columns, want)
+			}
+			if attempt == 0 {
+				return
+			}
+			res, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Miss || !bytes.Equal(res.OutputID, outputID) {
+				t.Fatalf("get migrated entry = %+v", res)
+			}
+			got, err := os.ReadFile(res.DiskPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, body) {
+				t.Fatalf("migrated body = %q, want %q", got, body)
+			}
+		}()
 	}
 }
 
