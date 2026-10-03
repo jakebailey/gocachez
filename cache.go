@@ -73,29 +73,40 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	blobPath := st.blobPath(outputHex)
 	compressedSize, blobExists := existingFileSize(blobPath)
 
-	bodyPath, err := st.createLiveFile(outputHex)
-	if err != nil {
-		return response{}, err
+	bodyPath := st.reusableMaterializedPath(outputHex, req.BodySize)
+	keepBody := bodyPath != ""
+	if !keepBody {
+		bodyPath, err = st.createLiveFile(outputHex)
+		if err != nil {
+			return response{}, err
+		}
 	}
-	keepBody := false
 	defer func() {
 		if !keepBody {
 			_ = os.Remove(bodyPath)
 		}
 	}()
 
-	bodyFile, err := os.Create(bodyPath)
-	if err != nil {
-		return response{}, fmt.Errorf("create live file: %w", err)
+	var bodyFile *os.File
+	var bodyWriter io.Writer = io.Discard
+	if !keepBody {
+		bodyFile, err = os.Create(bodyPath)
+		if err != nil {
+			return response{}, fmt.Errorf("create live file: %w", err)
+		}
+		bodyWriter = bodyFile
 	}
 
 	var written int64
 	if blobExists {
-		written, err = io.Copy(bodyFile, body)
+		written, err = io.Copy(bodyWriter, body)
 	} else {
-		written, compressedSize, err = st.writeNewBlob(bodyFile, body, blobDir, outputHex)
+		written, compressedSize, err = st.writeNewBlob(bodyWriter, body, blobDir, outputHex)
 	}
-	bodyCloseErr := bodyFile.Close()
+	var bodyCloseErr error
+	if bodyFile != nil {
+		bodyCloseErr = bodyFile.Close()
+	}
 	if err != nil {
 		return response{}, fmt.Errorf("read put body: %w", err)
 	}
@@ -139,7 +150,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	}, nil
 }
 
-func (st *store) writeNewBlob(bodyFile *os.File, body io.Reader, blobDir, outputHex string) (int64, int64, error) {
+func (st *store) writeNewBlob(bodyWriter io.Writer, body io.Reader, blobDir, outputHex string) (int64, int64, error) {
 	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
 	if err != nil {
 		return 0, 0, fmt.Errorf("create compressed file: %w", err)
@@ -152,7 +163,7 @@ func (st *store) writeNewBlob(bodyFile *os.File, body io.Reader, blobDir, output
 		_ = blobTmp.Close()
 		return 0, 0, fmt.Errorf("create zstd encoder: %w", err)
 	}
-	written, copyErr := io.Copy(io.MultiWriter(bodyFile, zw), body)
+	written, copyErr := io.Copy(io.MultiWriter(bodyWriter, zw), body)
 	encoderCloseErr := zw.Close()
 	st.putEncoder(zw)
 	blobCloseErr := blobTmp.Close()
@@ -210,6 +221,18 @@ func existingFileSize(path string) (int64, bool) {
 		return 0, false
 	}
 	return info.Size(), true
+}
+
+func (st *store) reusableMaterializedPath(outputID string, size int64) string {
+	st.mu.Lock()
+	path := st.materialized[outputID]
+	st.mu.Unlock()
+	if path != "" {
+		if existingSize, ok := existingFileSize(path); ok && existingSize == size {
+			return path
+		}
+	}
+	return ""
 }
 
 func (st *store) get(req request) (response, error) {

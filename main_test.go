@@ -394,13 +394,14 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 	body := bytes.Repeat([]byte("duplicate output"), 1024)
 	outputID := sha256Sum(body)
 	outputHex := hexOf(outputID)
-	if _, err := st.put(request{
+	original, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: bytes.Repeat([]byte{41}, 32),
 		OutputID: outputID,
 		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
 		t.Fatal(err)
 	}
 	originalBlob, err := os.ReadFile(st.blobPath(outputHex))
@@ -412,14 +413,18 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 		reader: encodedBody(body),
 		path:   st.blobPath(outputHex),
 	}
-	if _, err := st.put(request{
+	reused, err := st.put(request{
 		ID:       2,
 		Command:  cmdPut,
 		ActionID: bytes.Repeat([]byte{42}, 32),
 		OutputID: outputID,
 		BodySize: int64(len(body)),
-	}, bufio.NewReader(removeReader)); err != nil {
+	}, bufio.NewReader(removeReader))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if reused.DiskPath != original.DiskPath {
+		t.Fatalf("recovered put path = %q, want %q", reused.DiskPath, original.DiskPath)
 	}
 	recreatedBlob, err := os.ReadFile(st.blobPath(outputHex))
 	if err != nil {
@@ -427,6 +432,236 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 	}
 	if !bytes.Equal(recreatedBlob, originalBlob) {
 		t.Fatal("recreated blob differs from original compressed content")
+	}
+	if err := os.Remove(st.blobPath(outputHex)); err != nil {
+		t.Fatal(err)
+	}
+	reused, err = st.put(request{
+		ID:       3,
+		Command:  cmdPut,
+		ActionID: bytes.Repeat([]byte{43}, 32),
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.DiskPath != original.DiskPath {
+		t.Fatalf("put with missing blob path = %q, want %q", reused.DiskPath, original.DiskPath)
+	}
+	recreatedBlob, err = os.ReadFile(st.blobPath(outputHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recreatedBlob, originalBlob) {
+		t.Fatal("blob recreated from the put body differs from original")
+	}
+}
+
+func TestPutRecreatesStaleMaterializedOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing=%t", missing), func(t *testing.T) {
+			t.Parallel()
+			st, err := newStore(config{dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.close()
+			body := []byte("body")
+			req := request{
+				ID:       1,
+				Command:  cmdPut,
+				ActionID: sha256Sum([]byte("original")),
+				OutputID: sha256Sum(body),
+				BodySize: int64(len(body)),
+			}
+			original, err := st.put(req, bufio.NewReader(encodedBody(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if missing {
+				err = os.Remove(original.DiskPath)
+			} else {
+				err = os.Truncate(original.DiskPath, 0)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ID = 2
+			req.ActionID = sha256Sum([]byte("replacement"))
+			res, err := st.put(req, bufio.NewReader(encodedBody(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.DiskPath == original.DiskPath {
+				t.Fatal("put reused a missing or wrong-sized live file")
+			}
+			got, err := os.ReadFile(res.DiskPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, body) {
+				t.Fatal("replacement live file differs from put body")
+			}
+		})
+	}
+}
+
+func TestPutReusesMaterializedOutput(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{0, 1 << 20} {
+		t.Run(fmt.Sprintf("bytes=%d", size), func(t *testing.T) {
+			t.Parallel()
+			st, err := newStore(config{dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.close()
+			body := bytes.Repeat([]byte("x"), size)
+			outputID := bytes.Repeat([]byte{44}, 32)
+			paths := make(map[string]struct{})
+			for i := range 8 {
+				var input io.Reader = strings.NewReader("")
+				if size != 0 {
+					input = encodedBody(body)
+				}
+				br := bufio.NewReader(io.MultiReader(input, strings.NewReader("\n{\"ID\":99,\"Command\":\"close\"}\n")))
+				actionID := sha256Sum([]byte(fmt.Sprintf("action %d", i)))
+				res, err := st.put(request{
+					ID:       int64(i + 1),
+					Command:  cmdPut,
+					ActionID: actionID,
+					OutputID: outputID,
+					BodySize: int64(size),
+				}, br)
+				if err != nil {
+					t.Fatal(err)
+				}
+				paths[res.DiskPath] = struct{}{}
+				next, err := readRequest(br)
+				if err != nil || next.ID != 99 || next.Command != cmdClose {
+					t.Fatalf("put did not consume its body: next=%+v, err=%v", next, err)
+				}
+				got, err := st.get(request{ID: 100, Command: cmdGet, ActionID: actionID})
+				if err != nil || got.Miss || got.DiskPath != res.DiskPath {
+					t.Fatalf("get after put = %+v, err=%v", got, err)
+				}
+			}
+			if len(paths) != 1 {
+				t.Fatalf("shared output puts created %d live files, want 1", len(paths))
+			}
+			files, err := os.ReadDir(st.runDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(files) != 2 {
+				t.Fatalf("live run contains %d files, want one artifact and run.lock", len(files))
+			}
+			for path := range paths {
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatal("reused live file differs from the put body")
+				}
+			}
+		})
+	}
+}
+
+func TestPutReuseRejectsInvalidBody(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		input io.Reader
+	}{
+		{"short", encodedBody([]byte("bod"))},
+		{"long", encodedBody([]byte("body!"))},
+		{"invalid-base64", strings.NewReader("\"%%%\"\n")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := newStore(config{dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.close()
+			body := []byte("body")
+			req := request{
+				ID:       1,
+				Command:  cmdPut,
+				ActionID: sha256Sum([]byte("original")),
+				OutputID: sha256Sum(body),
+				BodySize: int64(len(body)),
+			}
+			original, err := st.put(req, bufio.NewReader(encodedBody(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.ID = 2
+			req.ActionID = sha256Sum([]byte("invalid"))
+			br := bufio.NewReader(io.MultiReader(tt.input, strings.NewReader("\n{\"ID\":99,\"Command\":\"close\"}\n")))
+			if _, err := st.put(req, br); err == nil {
+				t.Fatal("reused put accepted an invalid body")
+			}
+			next, err := readRequest(br)
+			if err != nil || next.ID != 99 {
+				t.Fatalf("invalid body was not drained: next=%+v, err=%v", next, err)
+			}
+			got, err := os.ReadFile(original.DiskPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, body) {
+				t.Fatal("invalid put changed the existing live file")
+			}
+			if _, found, err := st.lookupEntry(hexOf(req.ActionID)); err != nil || found {
+				t.Fatalf("invalid put registered an action: found=%t, err=%v", found, err)
+			}
+		})
+	}
+}
+
+func BenchmarkPutSharedOutput(b *testing.B) {
+	for _, size := range []int{0, 1 << 20} {
+		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
+			st, err := newStore(config{dir: b.TempDir()})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(st.close)
+			body := bytes.Repeat([]byte("x"), size)
+			var input []byte
+			if size != 0 {
+				input, err = io.ReadAll(encodedBody(body))
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			req := request{
+				ID:       1,
+				Command:  cmdPut,
+				ActionID: sha256Sum([]byte("original")),
+				OutputID: sha256Sum(body),
+				BodySize: int64(size),
+			}
+			if _, err := st.put(req, bufio.NewReader(bytes.NewReader(input))); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for i := range b.N {
+				req.ID = int64(i + 2)
+				req.ActionID = sha256Sum([]byte(fmt.Sprintf("action %d", i)))
+				if _, err := st.put(req, bufio.NewReader(bytes.NewReader(input))); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
