@@ -573,57 +573,82 @@ func TestPutReusesMaterializedOutput(t *testing.T) {
 	}
 }
 
-func TestPutReuseRejectsInvalidBody(t *testing.T) {
+func TestPutRejectsInvalidBody(t *testing.T) {
 	t.Parallel()
 
-	for _, tt := range []struct {
-		name  string
-		input io.Reader
-	}{
-		{"short", encodedBody([]byte("bod"))},
-		{"long", encodedBody([]byte("body!"))},
-		{"invalid-base64", strings.NewReader("\"%%%\"\n")},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			st, err := newStore(config{dir: t.TempDir()})
-			if err != nil {
-				t.Fatal(err)
+	for _, size := range []int{4, putWriteBufferSize + 17} {
+		body := bytes.Repeat([]byte("x"), size)
+		for _, mode := range []string{"reused-live", "existing-blob", "new-blob"} {
+			for _, tt := range []struct {
+				name  string
+				input string
+			}{
+				{"short", encodedBody(body[:size-1]).String()},
+				{"long", encodedBody(append(bytes.Clone(body), 'x')).String()},
+				{"invalid-base64", "\"" + base64.StdEncoding.EncodeToString(body) + "%%%\"\n"},
+			} {
+				t.Run(fmt.Sprintf("bytes=%d/%s/%s", size, mode, tt.name), func(t *testing.T) {
+					t.Parallel()
+					st, err := newStore(config{dir: t.TempDir()})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer st.close()
+					req := request{
+						ID:       1,
+						Command:  cmdPut,
+						ActionID: sha256Sum([]byte("original")),
+						OutputID: sha256Sum(body),
+						BodySize: int64(size),
+					}
+					original, err := st.put(req, bufio.NewReader(encodedBody(body)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if mode != "reused-live" {
+						st.deleteMaterialized(hexOf(req.OutputID))
+						if err := os.Remove(original.DiskPath); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if mode == "new-blob" {
+						if err := os.Remove(st.blobPath(hexOf(req.OutputID))); err != nil {
+							t.Fatal(err)
+						}
+					}
+					req.ID = 2
+					req.ActionID = sha256Sum([]byte("invalid"))
+					br := bufio.NewReader(strings.NewReader(tt.input + "\n{\"ID\":99,\"Command\":\"close\"}\n"))
+					if _, err := st.put(req, br); err == nil {
+						t.Fatal("put accepted an invalid body")
+					}
+					next, err := readRequest(br)
+					if err != nil || next.ID != 99 {
+						t.Fatalf("invalid body was not drained: next=%+v, err=%v", next, err)
+					}
+					if mode == "reused-live" {
+						got, err := os.ReadFile(original.DiskPath)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !bytes.Equal(got, body) {
+							t.Fatal("invalid put changed the existing live file")
+						}
+					} else {
+						files, err := os.ReadDir(st.runDir)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if len(files) != 1 || files[0].Name() != "run.lock" {
+							t.Fatalf("invalid put left live files: %v", files)
+						}
+					}
+					if _, found, err := st.lookupEntry(hexOf(req.ActionID)); err != nil || found {
+						t.Fatalf("invalid put registered an action: found=%t, err=%v", found, err)
+					}
+				})
 			}
-			defer st.close()
-			body := []byte("body")
-			req := request{
-				ID:       1,
-				Command:  cmdPut,
-				ActionID: sha256Sum([]byte("original")),
-				OutputID: sha256Sum(body),
-				BodySize: int64(len(body)),
-			}
-			original, err := st.put(req, bufio.NewReader(encodedBody(body)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			req.ID = 2
-			req.ActionID = sha256Sum([]byte("invalid"))
-			br := bufio.NewReader(io.MultiReader(tt.input, strings.NewReader("\n{\"ID\":99,\"Command\":\"close\"}\n")))
-			if _, err := st.put(req, br); err == nil {
-				t.Fatal("reused put accepted an invalid body")
-			}
-			next, err := readRequest(br)
-			if err != nil || next.ID != 99 {
-				t.Fatalf("invalid body was not drained: next=%+v, err=%v", next, err)
-			}
-			got, err := os.ReadFile(original.DiskPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, body) {
-				t.Fatal("invalid put changed the existing live file")
-			}
-			if _, found, err := st.lookupEntry(hexOf(req.ActionID)); err != nil || found {
-				t.Fatalf("invalid put registered an action: found=%t, err=%v", found, err)
-			}
-		})
+		}
 	}
 }
 
@@ -662,6 +687,192 @@ func BenchmarkPutSharedOutput(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkPutFreshLiveFile(b *testing.B) {
+	for _, size := range []int{0, 1024, 1 << 20} {
+		for _, blobExists := range []bool{true, false} {
+			b.Run(fmt.Sprintf("bytes=%d/blob-exists=%t", size, blobExists), func(b *testing.B) {
+				st, err := newStore(config{dir: b.TempDir()})
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(st.close)
+				body := bytes.Repeat([]byte("x"), size)
+				var input []byte
+				if size != 0 {
+					input, err = io.ReadAll(encodedBody(body))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				req := request{
+					ID:       1,
+					Command:  cmdPut,
+					ActionID: sha256Sum([]byte("action")),
+					OutputID: sha256Sum(body),
+					BodySize: int64(size),
+				}
+				res, err := st.put(req, bufio.NewReader(bytes.NewReader(input)))
+				if err != nil {
+					b.Fatal(err)
+				}
+				outputHex := hexOf(req.OutputID)
+				b.ReportAllocs()
+				b.SetBytes(int64(size))
+				b.ResetTimer()
+				for range b.N {
+					st.deleteMaterialized(outputHex)
+					if err := os.Remove(res.DiskPath); err != nil {
+						b.Fatal(err)
+					}
+					if !blobExists {
+						if err := os.Remove(st.blobPath(outputHex)); err != nil {
+							b.Fatal(err)
+						}
+					}
+					res, err = st.put(req, bufio.NewReader(bytes.NewReader(input)))
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPutBodyWriterBuffersChunks(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{0, 1, putWriteBufferSize - 1, putWriteBufferSize, putWriteBufferSize + 1, 1<<20 + 17} {
+		for _, multiWriter := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bytes=%d/multiwriter=%t", size, multiWriter), func(t *testing.T) {
+				t.Parallel()
+				st := new(store)
+				body := bytes.Repeat([]byte("x"), size)
+				for range 2 {
+					dst := new(recordingBodyWriter)
+					bw := st.getBodyWriter(dst)
+					var writer io.Writer = bw
+					if multiWriter {
+						writer = io.MultiWriter(bw, io.Discard)
+					}
+					br := bufio.NewReader(encodedBody(body))
+					src, err := bodyReader(br, int64(size))
+					if err != nil {
+						t.Fatal(err)
+					}
+					written, err := io.Copy(writer, src)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := bw.Flush(); err != nil {
+						t.Fatal(err)
+					}
+					st.putBodyWriter(bw)
+					if written != int64(size) || !bytes.Equal(dst.Bytes(), body) {
+						t.Fatalf("buffered body differs: written=%d, want %d", written, size)
+					}
+					if dst.readFromCalled {
+						t.Fatal("buffered writer delegated to the destination's ReadFrom")
+					}
+					wantWrites := (size + putWriteBufferSize - 1) / putWriteBufferSize
+					if len(dst.writeSizes) != wantWrites {
+						t.Fatalf("body used %d writes, want %d", len(dst.writeSizes), wantWrites)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPutBodyWriterResetsAfterError(t *testing.T) {
+	t.Parallel()
+
+	st := new(store)
+	bw := st.getBodyWriter(errWriter{})
+	if _, err := bw.WriteString("discarded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err == nil {
+		t.Fatal("flush succeeded with a failing destination")
+	}
+	st.putBodyWriter(bw)
+
+	var dst bytes.Buffer
+	bw = st.getBodyWriter(&dst)
+	defer st.putBodyWriter(bw)
+	if _, err := bw.WriteString("replacement"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if dst.String() != "replacement" {
+		t.Fatalf("reused buffered writer produced %q, want replacement", dst.String())
+	}
+}
+
+func TestPutFlushesBufferedBody(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{1, putWriteBufferSize - 1, putWriteBufferSize, putWriteBufferSize + 1} {
+		for _, blobExists := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bytes=%d/blob-exists=%t", size, blobExists), func(t *testing.T) {
+				t.Parallel()
+				st, err := newStore(config{dir: t.TempDir()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer st.close()
+				body := bytes.Repeat([]byte("x"), size)
+				req := request{
+					ID:       1,
+					Command:  cmdPut,
+					ActionID: sha256Sum([]byte("action")),
+					OutputID: sha256Sum(body),
+					BodySize: int64(size),
+				}
+				outputHex := hexOf(req.OutputID)
+				if blobExists {
+					res, err := st.put(req, bufio.NewReader(encodedBody(body)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					st.deleteMaterialized(outputHex)
+					if err := os.Remove(res.DiskPath); err != nil {
+						t.Fatal(err)
+					}
+				}
+				res, err := st.put(req, bufio.NewReader(encodedBody(body)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(res.DiskPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatal("put published an incompletely flushed live file")
+				}
+				st.deleteMaterialized(outputHex)
+				if err := os.Remove(res.DiskPath); err != nil {
+					t.Fatal(err)
+				}
+				res, err = st.get(request{ID: 2, Command: cmdGet, ActionID: req.ActionID})
+				if err != nil || res.Miss {
+					t.Fatalf("get after buffered put = %+v, err=%v", res, err)
+				}
+				got, err = os.ReadFile(res.DiskPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatal("compressed blob differs from the buffered put body")
+				}
+			})
+		}
 	}
 }
 
@@ -5015,6 +5226,23 @@ type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write failed")
+}
+
+type recordingBodyWriter struct {
+	bytes.Buffer
+
+	writeSizes     []int
+	readFromCalled bool
+}
+
+func (w *recordingBodyWriter) Write(p []byte) (int, error) {
+	w.writeSizes = append(w.writeSizes, len(p))
+	return w.Buffer.Write(p)
+}
+
+func (w *recordingBodyWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.readFromCalled = true
+	return io.Copy(struct{ io.Writer }{w}, r)
 }
 
 type removeFileReader struct {

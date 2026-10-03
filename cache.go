@@ -39,6 +39,7 @@ const (
 	accessFlushInterval    = 30 * time.Second
 	accessFlushThreshold   = 256
 	accessFlushMinInterval = time.Second
+	putWriteBufferSize     = 32 * 1024
 )
 
 var decoderOptions = []zstd.DOption{
@@ -88,6 +89,7 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	}()
 
 	var bodyFile *os.File
+	var bodyBuffer *bufio.Writer
 	bodyWriter := io.Discard
 	if !keepBody {
 		bodyFile, err = os.Create(bodyPath)
@@ -95,6 +97,11 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 			return response{}, fmt.Errorf("create live file: %w", err)
 		}
 		bodyWriter = bodyFile
+		if req.BodySize > 0 {
+			bodyBuffer = st.getBodyWriter(bodyFile)
+			defer st.putBodyWriter(bodyBuffer)
+			bodyWriter = bodyBuffer
+		}
 	}
 
 	var written int64
@@ -103,16 +110,23 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	} else {
 		written, compressedSize, err = st.writeNewBlob(bodyWriter, body, blobDir, outputHex)
 	}
-	var bodyCloseErr error
+	var bodyFinishErr error
+	if bodyBuffer != nil {
+		if flushErr := bodyBuffer.Flush(); flushErr != nil {
+			bodyFinishErr = fmt.Errorf("flush live file: %w", flushErr)
+		}
+	}
 	if bodyFile != nil {
-		bodyCloseErr = bodyFile.Close()
+		if closeErr := bodyFile.Close(); closeErr != nil {
+			bodyFinishErr = errors.Join(bodyFinishErr, fmt.Errorf("close live file: %w", closeErr))
+		}
 	}
 	if err != nil {
-		return response{}, fmt.Errorf("read put body: %w", err)
+		return response{}, errors.Join(fmt.Errorf("read put body: %w", err), bodyFinishErr)
 	}
 	bodyDrained = true
-	if bodyCloseErr != nil {
-		return response{}, fmt.Errorf("close live file: %w", bodyCloseErr)
+	if bodyFinishErr != nil {
+		return response{}, bodyFinishErr
 	}
 	if written != req.BodySize {
 		return response{}, fmt.Errorf("put body size mismatch: got %d bytes, expected %d", written, req.BodySize)
@@ -420,6 +434,21 @@ func (st *store) materialize(ent entry) (string, error) {
 
 	keepBody = true
 	return bodyPath, nil
+}
+
+func (st *store) getBodyWriter(w io.Writer) *bufio.Writer {
+	// Hide ReaderFrom so bufio cannot bypass buffering for os.File.
+	writer := struct{ io.Writer }{w}
+	if buf, ok := st.bodyWriterPool.Get().(*bufio.Writer); ok {
+		buf.Reset(writer)
+		return buf
+	}
+	return bufio.NewWriterSize(writer, putWriteBufferSize)
+}
+
+func (st *store) putBodyWriter(w *bufio.Writer) {
+	w.Reset(io.Discard)
+	st.bodyWriterPool.Put(w)
 }
 
 func (st *store) getEncoder(w io.Writer) (*zstd.Encoder, error) {

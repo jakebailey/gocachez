@@ -69,6 +69,7 @@ type store struct {
 	runDir            string
 	runLock           *flock.Flock
 	mu                sync.Mutex
+	bodyWriterPool    sync.Pool
 	encoderPool       sync.Pool
 	decoderPool       sync.Pool
 	materialized      map[string]string
