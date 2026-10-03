@@ -46,6 +46,28 @@ func stripPackageArchiveToExportWithFallback(path, exportPath string, onCopyFall
 		_ = in.Close()
 		return false, nil
 	}
+	copySize := size
+	if size%2 != 0 {
+		copySize++
+	}
+	if exportPath != "" && regularFile(exportPath) {
+		info, err := in.Stat()
+		if err != nil {
+			_ = in.Close()
+			return false, fmt.Errorf("stat live archive: %w", err)
+		}
+		if copySize > info.Size()-int64(len(prefix)) {
+			_ = in.Close()
+			return false, fmt.Errorf("copy package export data: %w", io.EOF)
+		}
+		if err := in.Close(); err != nil {
+			return false, fmt.Errorf("close live archive: %w", err)
+		}
+		if err := reuseRetainedFile(path, exportPath, onCopyFallback); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 
 	tmpDir := filepath.Dir(path)
 	if exportPath != "" {
@@ -69,10 +91,6 @@ func stripPackageArchiveToExportWithFallback(path, exportPath string, onCopyFall
 		_ = in.Close()
 		_ = tmp.Close()
 		return false, fmt.Errorf("write stripped export archive header: %w", err)
-	}
-	copySize := size
-	if size%2 != 0 {
-		copySize++
 	}
 	if _, err := io.CopyN(tmp, in, copySize); err != nil {
 		_ = in.Close()
@@ -217,6 +235,16 @@ func retainEscapedIndexedExportDataWithFallback(path, retainedPath string, onCop
 }
 
 func retainEscapedFileWithFallback(path, retainedPath string, onCopyFallback func()) error {
+	if regularFile(retainedPath) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("read retained live file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("read retained live file: %s is not a regular file", path)
+		}
+		return reuseRetainedFile(path, retainedPath, onCopyFallback)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read retained live file: %w", err)
@@ -228,6 +256,13 @@ func retainEscapedFileWithFallback(path, retainedPath string, onCopyFallback fun
 		return err
 	}
 	return nil
+}
+
+func reuseRetainedFile(path, retainedPath string, onCopyFallback func()) error {
+	if err := markRetainedFileUsed(retainedPath); err != nil {
+		return err
+	}
+	return replaceWithExportArchiveWithFallback(retainedPath, path, onCopyFallback)
 }
 
 func retainedGeneratedSourceKind(data []byte) (retainedTypeKind, bool) {

@@ -990,6 +990,133 @@ func TestCloseStoresRetainedExports(t *testing.T) {
 	}
 }
 
+func TestReuseRetainedArchiveWithoutWritingRetainedDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "live.a")
+	retainedDir := filepath.Join(dir, "retained")
+	retainedPath := filepath.Join(retainedDir, "export.a")
+	body := goArchive(goPkgdef([]byte("uFAKE")), []byte("object data"))
+	if err := os.WriteFile(livePath, body, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
+		t.Fatalf("initial retention = %t, err=%v", retained, err)
+	}
+	if err := os.Remove(livePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(livePath, body, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(retainedDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(retainedDir, 0o755) //nolint:errcheck
+	probe, err := os.CreateTemp(retainedDir, "permission-probe-")
+	if err == nil {
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+		t.Skip("directory write permissions are not enforced")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatal(err)
+	}
+	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
+		t.Fatalf("reuse in read-only retained dir = %t, err=%v", retained, err)
+	}
+	if got := readExportData(t, livePath); !bytes.Equal(got, []byte("uFAKE")) {
+		t.Fatalf("reused export data = %q", got)
+	}
+}
+
+func TestRetainedFileReusePreservesValidation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	livePath := filepath.Join(dir, "live.a")
+	retainedPath := filepath.Join(dir, "retained", "export.a")
+	body := goArchive(goPkgdef([]byte("uFAKE")), []byte("object data"))
+	if err := os.WriteFile(livePath, body, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
+		t.Fatalf("initial retention = %t, err=%v", retained, err)
+	}
+	if err := os.Remove(livePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(livePath, body[:len(archiveMagic)+archiveHeaderLen], 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stripPackageArchiveToExport(livePath, retainedPath); !errors.Is(err, io.EOF) {
+		t.Fatalf("truncated archive error = %v, want EOF", err)
+	}
+	if err := os.Remove(livePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := retainEscapedFileWithFallback(livePath, retainedPath, nil); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing live file error = %v, want not exist", err)
+	}
+}
+
+func BenchmarkReuseRetainedFiles(b *testing.B) {
+	data := bytes.Repeat([]byte("retained export\n"), 1<<18)
+	for _, tt := range []struct {
+		name   string
+		body   []byte
+		retain func(string, string) error
+	}{
+		{
+			name: "archive",
+			body: goArchive(goPkgdef(data), []byte("object data")),
+			retain: func(path, retainedPath string) error {
+				retained, err := stripPackageArchiveToExport(path, retainedPath)
+				if err == nil && !retained {
+					return errors.New("package archive was not retained")
+				}
+				return err
+			},
+		},
+		{
+			name: "file",
+			body: data,
+			retain: func(path, retainedPath string) error {
+				return retainEscapedFileWithFallback(path, retainedPath, nil)
+			},
+		},
+	} {
+		b.Run("kind="+tt.name, func(b *testing.B) {
+			dir := b.TempDir()
+			livePath := filepath.Join(dir, "live")
+			retainedPath := filepath.Join(dir, "retained", "export")
+			if err := os.WriteFile(livePath, tt.body, 0o666); err != nil {
+				b.Fatal(err)
+			}
+			if err := tt.retain(livePath, retainedPath); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.StopTimer()
+			for range b.N {
+				if err := os.Remove(livePath); err != nil {
+					b.Fatal(err)
+				}
+				if err := os.WriteFile(livePath, tt.body, 0o666); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if err := tt.retain(livePath, retainedPath); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+			}
+		})
+	}
+}
+
 func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
 	t.Parallel()
 
@@ -1161,44 +1288,54 @@ func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
 func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
 	t.Parallel()
 
-	cacheDir := t.TempDir()
-	exportData := []byte("uFAKE")
-	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
-	outputID := bytes.Repeat([]byte{66}, 32)
-	for i := range 2 {
-		st, err := newStore(config{
-			dir:    cacheDir,
-			maxAge: defaultMaxAge,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.put(request{
-			ID:       1,
-			Command:  cmdPut,
-			ActionID: bytes.Repeat([]byte{byte(67 + i)}, 32),
-			OutputID: outputID,
-			BodySize: int64(len(body)),
-		}, bufio.NewReader(encodedBody(body))); err != nil {
-			t.Fatal(err)
-		}
-		st.close()
-		if i == 0 {
-			exportPath := retainedPath(cacheDir, outputID, ".a")
-			old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-			if err := os.Chtimes(exportPath, old, old); err != nil {
+	for _, tt := range []struct {
+		name string
+		ext  string
+		body []byte
+	}{
+		{"archive", ".a", goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))},
+		{"source", ".go", []byte(generatedTestmainSourcePrefix + "\nfunc main() {}\n")},
+		{"indexed", ".i", indexedExportData(t)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cacheDir := t.TempDir()
+			outputID := bytes.Repeat([]byte{66}, 32)
+			for i := range 2 {
+				st, err := newStore(config{
+					dir:    cacheDir,
+					maxAge: defaultMaxAge,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.put(request{
+					ID:       1,
+					Command:  cmdPut,
+					ActionID: bytes.Repeat([]byte{byte(67 + i)}, 32),
+					OutputID: outputID,
+					BodySize: int64(len(tt.body)),
+				}, bufio.NewReader(encodedBody(tt.body))); err != nil {
+					t.Fatal(err)
+				}
+				st.close()
+				if i == 0 {
+					path := retainedPath(cacheDir, outputID, tt.ext)
+					old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
+					if err := os.Chtimes(path, old, old); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			path := retainedPath(cacheDir, outputID, tt.ext)
+			info, err := os.Stat(path)
+			if err != nil {
 				t.Fatal(err)
 			}
-		}
-	}
-
-	exportPath := retainedPath(cacheDir, outputID, ".a")
-	info, err := os.Stat(exportPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.ModTime().After(trimCutoff(defaultMaxAge, time.Now())) {
-		t.Fatalf("retained export mtime = %v, want refreshed after cutoff", info.ModTime())
+			if !info.ModTime().After(trimCutoff(defaultMaxAge, time.Now())) {
+				t.Fatalf("retained file mtime = %v, want refreshed after cutoff", info.ModTime())
+			}
+		})
 	}
 }
 
