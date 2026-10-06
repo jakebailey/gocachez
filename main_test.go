@@ -14,7 +14,9 @@ import (
 	"go/types"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,150 @@ import (
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
+
+func TestGoCommandCache(t *testing.T) {
+	t.Setenv("GOENV", "off")
+	t.Setenv("GOFLAGS", "")
+	t.Setenv("GOWORK", "off")
+	t.Setenv("GOTOOLCHAIN", "local")
+	t.Setenv("GOCACHEPROG", "")
+	rootCmd := exec.CommandContext(t.Context(), "go", "env", "GOROOT")
+	root, err := rootCmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	goBin := filepath.Join(strings.TrimSpace(string(root)), "bin")
+
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "gocachez")
+	if runtime.GOOS == "windows" {
+		helper += ".exe"
+	}
+	goCommand := filepath.Join(goBin, "go")
+	build := exec.CommandContext(t.Context(), goCommand, "build", "-o", helper, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build gocachez: %v\n%s", err, output)
+	}
+
+	setUserDirEnv(t)
+	cacheDir := filepath.Join(dir, "cache")
+	t.Setenv("GOCACHE", filepath.Join(dir, "go-build"))
+	t.Setenv("GOCACHEPROG", fmt.Sprintf(`"%s" -dir "%s" -max-size 0 -max-age 0`, helper, cacheDir))
+	t.Setenv("GOCACHEZ_DIR", "")
+	t.Setenv("GOCACHEZ_MAX_SIZE", "")
+	t.Setenv("GOCACHEZ_MAX_AGE", "")
+	t.Setenv("GOCACHEZ_VERBOSE", "true")
+
+	moduleDir := filepath.Join(dir, "module")
+	if err := os.MkdirAll(moduleDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"go.mod": "module example.com/cachetest\n\ngo 1.25.0\n",
+		"main.go": `package main
+import "fmt"
+func answer() int { return 42 }
+func main() { fmt.Println(answer()) }
+`,
+		"main_test.go": `package main
+import "testing"
+func TestAnswer(t *testing.T) {
+	if got := answer(); got != 42 {
+		t.Fatalf("answer() = %d", got)
+	}
+}
+`,
+	} {
+		if err := os.WriteFile(filepath.Join(moduleDir, name), []byte(content), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, name := range []string{"cold", "warm"} {
+		t.Run(name, func(t *testing.T) {
+			testGoCommandExports(t, goCommand, moduleDir, cacheDir)
+			for _, args := range [][]string{{"run", "."}, {"test", "-count=1", "."}} {
+				cmd := exec.CommandContext(t.Context(), goCommand, args...)
+				cmd.Dir = moduleDir
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				output, err := cmd.Output()
+				if err != nil {
+					t.Fatalf("go %s: %v\n%s\n%s", strings.Join(args, " "), err, output, &stderr)
+				}
+				if args[0] == "run" && strings.TrimSpace(string(output)) != "42" {
+					t.Fatalf("go run output = %q, want 42", output)
+				}
+			}
+		})
+	}
+}
+
+func testGoCommandExports(t *testing.T, goCommand, moduleDir, cacheDir string) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), goCommand, "list", "-test", "-export", "-json", ".")
+	cmd.Dir = moduleDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list: %v\n%s", err, &stderr)
+	}
+	// Reported paths must remain readable after go list and its helper exit.
+	dec := json.NewDecoder(bytes.NewReader(output))
+	foundPackage, foundTestmain := false, false
+	for {
+		var pkg struct {
+			ImportPath string
+			Dir        string
+			Export     string
+			GoFiles    []string
+		}
+		if err := dec.Decode(&pkg); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if pkg.Export != "" {
+			if !strings.HasPrefix(pkg.Export, cacheDir+string(filepath.Separator)) {
+				t.Fatalf("export path bypassed gocachez: %s", pkg.Export)
+			}
+			data, err := os.ReadFile(pkg.Export)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) == 0 {
+				t.Fatalf("empty export data for %s", pkg.ImportPath)
+			}
+			if pkg.ImportPath == "example.com/cachetest" {
+				foundPackage = true
+			}
+		}
+		if pkg.ImportPath != "example.com/cachetest.test" {
+			continue
+		}
+		for _, path := range pkg.GoFiles {
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(pkg.Dir, path)
+			}
+			if !strings.HasPrefix(path, cacheDir+string(filepath.Separator)) {
+				t.Fatalf("test-main path bypassed gocachez: %s", path)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) == 0 {
+				t.Fatalf("empty test-main source: %s", path)
+			}
+			foundTestmain = true
+		}
+	}
+	if !foundPackage || !foundTestmain {
+		t.Fatalf("loaded package = %t, retained test main = %t", foundPackage, foundTestmain)
+	}
+}
 
 func TestStorePutGet(t *testing.T) {
 	t.Parallel()
