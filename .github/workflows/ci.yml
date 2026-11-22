@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  GOLANGCI_LINT_VERSION: v2.13.1
+  GOLANGCI_LINT_VERSION: v2.15.0
 
 # Ensure scripts are run with pipefail. See:
 # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#exit-codes-and-error-action-preference
