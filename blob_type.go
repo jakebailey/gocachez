@@ -174,7 +174,11 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKi
 			}()
 			for output := range jobs {
 				var classification blobClassification
-				classification, decoder = classifyCompressedBlob(blobPath(blobsDir, output.outputID), decoder)
+				if output.raw {
+					classification = classifyRawBlob(storedBlobPath(blobsDir, output.outputID, true))
+				} else {
+					classification, decoder = classifyCompressedBlob(blobPath(blobsDir, output.outputID), decoder)
+				}
 				results <- blobTypeResult{
 					output:         output,
 					classification: classification,
@@ -240,6 +244,19 @@ func classifyCompressedBlob(path string, decoder *zstd.Decoder) (blobClassificat
 		return blobClassification{kind: blobTypeUnreadable}, nil
 	}
 	return classifyBlobData(data), decoder
+}
+
+func classifyRawBlob(path string) blobClassification {
+	file, err := os.Open(path)
+	if err != nil {
+		return blobClassification{kind: blobTypeUnreadable}
+	}
+	defer file.Close() //nolint:errcheck
+	data, err := io.ReadAll(io.LimitReader(file, blobTypePrefixLimit))
+	if err != nil {
+		return blobClassification{kind: blobTypeUnreadable}
+	}
+	return classifyBlobData(data)
 }
 
 func classifyBlobData(data []byte) blobClassification {

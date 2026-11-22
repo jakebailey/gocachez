@@ -178,7 +178,7 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close() //nolint:errcheck
 
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
 	}

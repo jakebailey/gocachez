@@ -96,7 +96,7 @@ func writeStatus(cfg config, w io.Writer) error {
 	}
 	if err := writeTable(w, "Storage", [][]string{
 		{"Original output size", formatBytes(status.catalog.size)},
-		{"Compressed cache blobs", formatStorageSize(status.catalog.compressedSize, status.blobFiles)},
+		{"Stored cache blobs", formatStorageSize(status.catalog.compressedSize, status.blobFiles)},
 		{"Blob max usage", formatMaxUsage(status.catalog.compressedSize, status.maxSize)},
 		{"Retained go-list files", formatStorageSize(status.retainedSize, status.retainedFiles)},
 		{"Total stored", formatBytes(status.catalog.compressedSize + status.retainedSize)},
@@ -191,7 +191,7 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 
 	q := newCatalog(db)
-	var hasBlobType, hasRetainedType bool
+	var hasBlobType, hasRetainedType, hasRaw bool
 	err = db.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		var err error
 		hasBlobType, err = entriesHasColumn(conn, "blob_type_version")
@@ -199,12 +199,16 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 			return err
 		}
 		hasRetainedType, err = entriesHasColumn(conn, "retained_type_version")
+		if err != nil {
+			return err
+		}
+		hasRaw, err = entriesHasColumn(conn, "raw")
 		return err
 	})
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
 	}
-	outputs, err := q.listOutputs(context.Background(), hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
+	outputs, err := q.listOutputs(context.Background(), hasRaw, hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
@@ -223,7 +227,7 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 
 func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 	if len(statuses) == 0 {
-		return writeRightAlignedTable(w, "Compressed blob contents", [][]string{
+		return writeRightAlignedTable(w, "Blob contents", [][]string{
 			{"Type", "Files", "Original", "Stored", "Savings"},
 			{"None", "0", formatBytes(0), formatBytes(0), formatAlignedSavings(0, 0, 2, 4)},
 		})
@@ -241,7 +245,7 @@ func writeBlobTypeStatus(w io.Writer, statuses []blobTypeStatus) error {
 			formatAlignedSavings(status.size, status.compressedSize, amountWidth, percentWidth),
 		})
 	}
-	return writeRightAlignedTable(w, "Compressed blob contents", rows)
+	return writeRightAlignedTable(w, "Blob contents", rows)
 }
 
 func savingsWidths(statuses []blobTypeStatus) (int, int) {

@@ -12,19 +12,20 @@ import (
 // sqlite.Conn caches their prepared statements independently on each pooled
 // connection.
 const lookupEntrySQL = `
-SELECT action_id, output_id, size, compressed_size, created_at, accessed_at
+SELECT action_id, output_id, size, compressed_size, created_at, accessed_at, raw
 FROM entries
 WHERE action_id = ?`
 
 const upsertEntrySQL = `
-INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO entries(action_id, output_id, size, compressed_size, created_at, accessed_at, raw)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(action_id) DO UPDATE SET
 	output_id = excluded.output_id,
 	size = excluded.size,
 	compressed_size = excluded.compressed_size,
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at,
+	raw = excluded.raw,
 	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END,
 	blob_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type_version END,
 	retained_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type END,
@@ -51,6 +52,7 @@ type catalogOutput struct {
 	outputID       string
 	size           int64
 	compressedSize int64
+	raw            bool
 	blobType       optionalInt64
 	retainedType   optionalInt64
 }
@@ -175,6 +177,7 @@ WHERE action_id = ?`, func(stmt *sqlite.Stmt) {
 			stmt.BindInt64(4, ent.CompressedSize)
 			stmt.BindInt64(5, unixMillis(ent.CreatedAt))
 			stmt.BindInt64(6, unixMillis(ent.AccessedAt))
+			stmt.BindBool(7, ent.Raw)
 		}); err != nil {
 			return err
 		}
@@ -202,6 +205,7 @@ func (c *catalog) lookupEntry(ctx context.Context, actionID string) (entry, bool
 			ent.CompressedSize = stmt.ColumnInt64(3)
 			createdAt = stmt.ColumnInt64(4)
 			accessedAt = stmt.ColumnInt64(5)
+			ent.Raw = stmt.ColumnBool(6)
 		})
 		return err
 	})
@@ -291,12 +295,18 @@ func (c *catalog) reconcileCompressedSize(ctx context.Context) (int64, error) {
 // so they get recomputed. blobType is only available on migrated caches.
 func (c *catalog) listOutputs(
 	ctx context.Context,
+	includeRaw bool,
 	includeBlobType bool,
 	blobClassifierVersion int64,
 	includeRetainedType bool,
 	retainedClassifierVersion int64,
 ) ([]catalogOutput, error) {
 	columns := "output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)"
+	if includeRaw {
+		columns += ", MAX(raw)"
+	} else {
+		columns += ", 0"
+	}
 	args := []any(nil)
 	if includeBlobType {
 		columns += ", MAX(CASE WHEN blob_type_version = ? THEN blob_type END)"
@@ -315,8 +325,9 @@ func (c *catalog) listOutputs(
 					outputID:       stmt.ColumnText(0),
 					size:           stmt.ColumnInt64(1),
 					compressedSize: stmt.ColumnInt64(2),
+					raw:            stmt.ColumnBool(3),
 				}
-				column := 3
+				column := 4
 				if includeBlobType {
 					if !stmt.ColumnIsNull(column) {
 						output.blobType = optionalInt64{value: stmt.ColumnInt64(column), ok: true}
@@ -334,19 +345,48 @@ func (c *catalog) listOutputs(
 	return outputs, err
 }
 
-func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, outputIDs map[string]struct{}) error {
+func (c *catalog) referencedOutputIDs(ctx context.Context, lower, upper string, outputIDs map[string]bool) error {
 	return c.useConn(ctx, func(conn *sqlite.Conn) error {
 		clear(outputIDs)
 		return sqlitex.Execute(conn, `
-SELECT DISTINCT output_id
+SELECT output_id, MAX(raw)
 FROM entries
-WHERE output_id >= ? AND output_id < ?`, &sqlitex.ExecOptions{
+WHERE output_id >= ? AND output_id < ?
+GROUP BY output_id`, &sqlitex.ExecOptions{
 			Args: []any{lower, upper},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
-				outputIDs[stmt.ColumnText(0)] = struct{}{}
+				outputIDs[stmt.ColumnText(0)] = stmt.ColumnBool(1)
 				return nil
 			},
 		})
+	})
+}
+
+func (c *catalog) isRawOutput(ctx context.Context, outputID string) (bool, error) {
+	var raw int64
+	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		raw, err = queryInt64(conn, `SELECT COALESCE(MAX(raw), 0) FROM entries WHERE output_id = ?`, []any{outputID})
+		return err
+	})
+	return raw != 0, err
+}
+
+func (c *catalog) promoteRawOutput(ctx context.Context, outputID string, size int64) error {
+	return c.db.withTx(ctx, func(conn *sqlite.Conn) error {
+		before, err := outputSizeSum(conn, []string{outputID})
+		if err != nil {
+			return err
+		}
+		if err := execute(conn, `
+UPDATE entries SET raw = 1, compressed_size = ?
+WHERE output_id = ?`, size, outputID); err != nil {
+			return err
+		}
+		if conn.Changes() == 0 {
+			return fmt.Errorf("promote missing output %s", outputID)
+		}
+		return adjustState(conn, compressedSizeStateKey, size-before)
 	})
 }
 

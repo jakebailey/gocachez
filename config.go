@@ -65,7 +65,7 @@ func parseFlagOperands(args []string) (config, []string, error) {
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&configPath, "config", configPath, "JSON config file")
 	fs.StringVar(&flagDir, "dir", "", "cache directory")
-	fs.StringVar(&flagMaxSize, "max-size", "", "maximum compressed cache size, or 0 to disable pruning")
+	fs.StringVar(&flagMaxSize, "max-size", "", "maximum stored blob size in total, or 0 to disable size pruning")
 	fs.StringVar(&flagMaxAge, "max-age", "", "maximum age of unused entries, or 0 to disable age-based pruning")
 	fs.BoolVar(&flagVerbose, "v", false, "log cache maintenance to stderr")
 	fs.StringVar(&cfg.cpuProfile, "cpuprofile", "", "write CPU profile to file")

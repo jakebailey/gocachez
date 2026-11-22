@@ -61,7 +61,7 @@ func validateDBVersion(db *sqliteDB) error {
 	if err != nil {
 		return fmt.Errorf("read catalog version: %w", err)
 	}
-	if version != cacheSchemaVersion {
+	if !supportedCatalogVersion(version) {
 		return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
 	}
 	return nil

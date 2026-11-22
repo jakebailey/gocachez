@@ -17,7 +17,14 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-const cacheSchemaVersion = 1
+const (
+	cacheDirVersion    = 1
+	cacheSchemaVersion = 2
+)
+
+func supportedCatalogVersion(version int64) bool {
+	return version == 1 || version == cacheSchemaVersion
+}
 
 const catalogSchema = `
 CREATE TABLE IF NOT EXISTS entries (
@@ -27,6 +34,7 @@ CREATE TABLE IF NOT EXISTS entries (
 	compressed_size INTEGER NOT NULL,
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL,
+	raw INTEGER NOT NULL DEFAULT 0,
 	blob_type INTEGER,
 	blob_type_version INTEGER,
 	retained_type INTEGER,
@@ -54,6 +62,7 @@ type entry struct {
 	CompressedSize int64
 	CreatedAt      time.Time
 	AccessedAt     time.Time
+	Raw            bool
 }
 
 type store struct {
@@ -74,6 +83,7 @@ type store struct {
 	decoderPool       sync.Pool
 	materialized      map[string]string
 	materializing     map[string]*materialization
+	rawCandidates     []rawCandidate
 	accessed          map[string]int64
 	lastAccessFlush   time.Time
 }
@@ -92,13 +102,16 @@ func newStore(cfg config) (*store, error) {
 	err := withFileLock(lifecycleLockPath, func() error {
 		var err error
 		st, err = newStoreLocked(cfg, versionDir, blobsDir, liveRoot, lifecycleLockPath)
-		return err
+		if err != nil {
+			return err
+		}
+		if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
+			log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	if err := st.cleanupAbandonedRuns(); err != nil && st.verbose {
-		log.Printf("gocachez: cleanup abandoned runs failed: %v", err)
 	}
 	return st, nil
 }
@@ -112,7 +125,7 @@ func cachePaths(cfg config) (string, string, string, string) {
 }
 
 func cacheVersionDir(cfg config) string {
-	return filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheSchemaVersion))
+	return filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheDirVersion))
 }
 
 func retainedRoot(versionDir string) string {
@@ -199,7 +212,7 @@ func initDB(db *sqliteDB) error {
 		if err != nil {
 			return fmt.Errorf("read catalog version: %w", err)
 		}
-		if version != 0 && version != cacheSchemaVersion {
+		if version != 0 && !supportedCatalogVersion(version) {
 			return fmt.Errorf("unsupported catalog version %d, want %d", version, cacheSchemaVersion)
 		}
 		if err := sqlitex.ExecuteScript(conn, catalogSchema, nil); err != nil {
@@ -222,15 +235,14 @@ func initDB(db *sqliteDB) error {
 	})
 }
 
-// migrateSchema applies in-place schema changes to caches created by earlier
-// versions of gocachez without bumping cacheSchemaVersion, so existing caches
-// keep working after an upgrade.
+// migrateSchema upgrades existing catalogs in place.
 func migrateSchema(conn *sqlite.Conn) error {
 	for _, col := range []struct{ name, ddl string }{
 		{"blob_type", "blob_type INTEGER"},
 		{"blob_type_version", "blob_type_version INTEGER"},
 		{"retained_type", "retained_type INTEGER"},
 		{"retained_type_version", "retained_type_version INTEGER"},
+		{"raw", "raw INTEGER NOT NULL DEFAULT 0"},
 	} {
 		has, err := entriesHasColumn(conn, col.name)
 		if err != nil {
@@ -253,7 +265,7 @@ func migrateSchema(conn *sqlite.Conn) error {
 		if err := execute(conn, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
 			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
 		}
-		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, compressed_size, size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
+		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, compressed_size, size, blob_type, blob_type_version, retained_type, retained_type_version, raw)`); err != nil {
 			return fmt.Errorf("create entries_output_cover index: %w", err)
 		}
 	}
@@ -272,6 +284,7 @@ func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 		"blob_type_version",
 		"retained_type",
 		"retained_type_version",
+		"raw",
 	}
 	var got []string
 	err := sqlitex.Execute(conn, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`, &sqlitex.ExecOptions{
@@ -289,6 +302,9 @@ func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 func (st *store) close() {
 	if err := st.flushAccessTimes(); err != nil && st.verbose {
 		log.Printf("gocachez: flush access times failed: %v", err)
+	}
+	if err := st.promoteRawBlobs(); err != nil && st.verbose {
+		log.Printf("gocachez: retain raw blobs failed: %v", err)
 	}
 	if err := st.unregisterRun(); err != nil && st.verbose {
 		log.Printf("gocachez: unregister run failed: %v", err)
@@ -311,9 +327,6 @@ func (st *store) registerRun() error {
 
 func (st *store) unregisterRun() error {
 	var err error
-	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
-		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
-	}
 	retainedLiveFiles, prepareErr := st.prepareLiveRunForClose()
 	if prepareErr != nil {
 		err = errors.Join(err, prepareErr)
@@ -322,6 +335,11 @@ func (st *store) unregisterRun() error {
 		now := time.Now()
 		if touchErr := os.Chtimes(st.runLock.Path(), now, now); touchErr != nil {
 			err = errors.Join(err, fmt.Errorf("timestamp retained live run: %w", touchErr))
+		}
+	}
+	if retainedLiveFiles && err == nil {
+		if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
+			err = fmt.Errorf("delete retained run record: %w", deleteErr)
 		}
 	}
 	if unlockErr := st.runLock.Unlock(); unlockErr != nil {
@@ -333,6 +351,11 @@ func (st *store) unregisterRun() error {
 	if !retainedLiveFiles {
 		if removeErr := os.RemoveAll(st.runDir); removeErr != nil {
 			err = errors.Join(err, fmt.Errorf("remove live run dir: %w", removeErr))
+		}
+	}
+	if !retainedLiveFiles && err == nil {
+		if err := st.q.deleteRun(context.Background(), st.runID); err != nil {
+			return fmt.Errorf("delete run record: %w", err)
 		}
 	}
 	return err
@@ -498,11 +521,6 @@ func (st *store) tryReclaimRun(runID, runDir, lockPath string) (bool, error) {
 		return false, nil
 	}
 
-	if err := st.q.deleteRun(context.Background(), runID); err != nil {
-		_ = runLock.Unlock()
-		_ = runLock.Close()
-		return false, fmt.Errorf("delete abandoned run record: %w", err)
-	}
 	if err := runLock.Unlock(); err != nil {
 		_ = runLock.Close()
 		return false, fmt.Errorf("unlock abandoned live run: %w", err)
@@ -512,6 +530,9 @@ func (st *store) tryReclaimRun(runID, runDir, lockPath string) (bool, error) {
 	}
 	if err := os.RemoveAll(runDir); err != nil {
 		return false, fmt.Errorf("remove abandoned live run dir: %w", err)
+	}
+	if err := st.q.deleteRun(context.Background(), runID); err != nil {
+		return false, fmt.Errorf("delete abandoned run record: %w", err)
 	}
 	return true, nil
 }

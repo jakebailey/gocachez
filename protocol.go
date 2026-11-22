@@ -101,6 +101,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) (err error) {
 
 	br := bufio.NewReader(stdin)
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	sem := make(chan struct{}, min(max(runtime.GOMAXPROCS(0), 1), 8))
 	for {
 		req, err := readRequest(br)

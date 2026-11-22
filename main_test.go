@@ -299,6 +299,188 @@ func TestGetMaterializesAfterLiveFileRemoved(t *testing.T) {
 	}
 }
 
+func TestLargeBlobPromotedAndReusedAcrossRuns(t *testing.T) {
+	cfg := config{dir: t.TempDir(), maxSize: 2 * rawBlobMinSize}
+	exportData := []byte("uFAKE")
+	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte{0x5a}, rawBlobMinSize))
+	size := int64(len(body))
+	actionID, aliasID, outputID := sha256Sum([]byte("action")), sha256Sum([]byte("alias")), sha256Sum(body)
+	outputHex := hexOf(outputID)
+
+	st, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zstdPath, rawPath := st.blobPath(outputHex), st.storedBlobPath(outputHex, true)
+	if err := os.MkdirAll(filepath.Dir(zstdPath), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCompressedFile(st, zstdPath, body); err != nil {
+		t.Fatal(err)
+	}
+	compressed, ok := existingFileSize(zstdPath)
+	if !ok || compressed >= size {
+		t.Fatalf("compressed blob size = %d, present = %t", compressed, ok)
+	}
+	now := time.Now()
+	for _, id := range [][]byte{actionID, aliasID} {
+		if err := st.upsertEntry(entry{ActionID: hexOf(id), OutputID: outputHex, Size: size, CompressedSize: compressed, CreatedAt: now, AccessedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	get := func(st *store, id []byte) string {
+		t.Helper()
+		res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: id})
+		if err != nil || res.Miss || res.Size != size {
+			t.Fatalf("get large blob = %+v, err = %v", res, err)
+		}
+		return res.DiskPath
+	}
+	other, err := newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get(st, actionID)
+	st.close()
+	if _, err := os.Stat(rawPath); !os.IsNotExist(err) {
+		t.Fatalf("raw representation while another run was active: %v", err)
+	}
+	firstPath := get(other, actionID)
+	other.close()
+
+	if _, err := os.Stat(zstdPath); !os.IsNotExist(err) {
+		t.Fatalf("compressed representation after promotion: %v", err)
+	}
+	if got := readExportData(t, firstPath); !bytes.Equal(got, exportData) {
+		t.Fatalf("export after promotion = %q, want %q", got, exportData)
+	}
+	status, err := readStatus(cfg)
+	if err != nil || status.catalog.outputs != 1 || status.catalog.compressedSize != size {
+		t.Fatalf("raw blob status = %+v, err = %v", status.catalog, err)
+	}
+	if len(status.blobTypes) != 1 || status.blobTypes[0].kind != blobTypeGoPackageArchive || status.blobTypes[0].count != 1 {
+		t.Fatalf("raw blob classifications = %+v, want one package archive", status.blobTypes)
+	}
+
+	st, err = newStore(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath := get(st, aliasID)
+	rawInfo, err := os.Stat(rawPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveInfo, err := os.Stat(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe := filepath.Join(st.runDir, "link-probe"); os.Link(rawPath, probe) == nil {
+		if err := os.Remove(probe); err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(rawInfo, liveInfo) {
+			t.Fatal("raw cache hit copied an artifact on a filesystem with hardlinks")
+		}
+	}
+	if got := compressedSizeForTest(t, st); got != size {
+		t.Fatalf("stored size with two aliases = %d, want %d", got, size)
+	}
+	put, err := st.put(request{
+		ID:       2,
+		Command:  cmdPut,
+		ActionID: aliasID,
+		OutputID: outputID,
+		BodySize: size,
+	}, bufio.NewReader(encodedBody(body)))
+	if err != nil || put.DiskPath != secondPath {
+		t.Fatalf("put for raw blob = %+v, err = %v", put, err)
+	}
+	if _, err := os.Stat(zstdPath); !os.IsNotExist(err) {
+		t.Fatalf("put recreated compressed representation: %v", err)
+	}
+	st.maxSize = size - 1
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(rawPath); !os.IsNotExist(err) {
+		t.Fatalf("raw blob after size eviction: %v", err)
+	}
+	if _, found, err := st.lookupEntry(hexOf(aliasID)); err != nil || found {
+		t.Fatalf("alias after size eviction: found = %t, err = %v", found, err)
+	}
+	if got, err := os.ReadFile(secondPath); err != nil || !bytes.Equal(sha256Sum(got), outputID) {
+		t.Fatalf("active run lost full artifact during size eviction: %v", err)
+	}
+	st.close()
+	if got := readExportData(t, secondPath); !bytes.Equal(got, exportData) {
+		t.Fatalf("export after raw hit = %q, want %q", got, exportData)
+	}
+}
+
+func TestRawBlobCopyFallback(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+	body := []byte("raw artifact")
+	if err := os.WriteFile(src, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkOrCopyFile(src, dst, func(string, string) error { return errors.ErrUnsupported }); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("copied blob = %q, err = %v", got, err)
+	}
+}
+
+func TestPruneReconcilesInterruptedRawPromotion(t *testing.T) {
+	t.Parallel()
+
+	st, err := newStore(config{dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	keep, remove := make([]string, 0, 2), make([]string, 0, 5)
+	for i, raw := range []bool{false, true} {
+		outputID := fmt.Sprintf("%064x", i)
+		if err := st.upsertEntry(entry{ActionID: outputID, OutputID: outputID, Size: 3, CompressedSize: 3, Raw: raw}); err != nil {
+			t.Fatal(err)
+		}
+		keep = append(keep, st.storedBlobPath(outputID, raw))
+		remove = append(remove, st.storedBlobPath(outputID, !raw))
+		remove = append(remove, st.storedBlobPath(outputID, true)+"-pending-123.raw")
+	}
+	remove = append(remove, st.storedBlobPath(strings.Repeat("2", 64), true))
+	for _, path := range append(keep, remove...) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("raw"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	if err := st.prune(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range keep {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("authoritative blob removed: %v", err)
+		}
+	}
+	for _, path := range remove {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("unpublished or superseded blob remains: %s: %v", path, err)
+		}
+	}
+}
+
 func TestConcurrentGetsMaterializeOnce(t *testing.T) {
 	t.Parallel()
 
@@ -2957,7 +3139,7 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.pruneCandidates(ctx); err == nil {
 		t.Fatal("pruneCandidates succeeded with canceled context")
 	}
-	if err := st.q.referencedOutputIDs(ctx, "00", "01", make(map[string]struct{})); err == nil {
+	if err := st.q.referencedOutputIDs(ctx, "00", "01", make(map[string]bool)); err == nil {
 		t.Fatal("referencedOutputIDs succeeded with canceled context")
 	}
 }
@@ -3535,13 +3717,13 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "Live runs           0 active, 0 inactive")
 	assertContains(t, got, "Storage:\n")
 	assertContains(t, got, "Original output size    0B")
-	assertContains(t, got, "Compressed cache blobs  0B (0 files)")
+	assertContains(t, got, "Stored cache blobs      0B (0 files)")
 	assertContains(t, got, "Blob max usage          0B / 20.0GiB (0.0%, 20.0GiB remaining)")
 	assertContains(t, got, "Retained go-list files  0B (0 files)")
 	assertContains(t, got, "Total stored            0B")
 	assertContains(t, got, "Blob-only savings       0B (0.0%)")
 	assertContains(t, got, "Overall savings         0B (0.0%)")
-	assertContains(t, got, "Compressed blob contents:\n")
+	assertContains(t, got, "Blob contents:\n")
 	assertContains(t, got, "None      0        0B      0B  0B (0.0%)")
 	assertContains(t, got, "Retained go-list files:\n")
 }
@@ -3630,13 +3812,13 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "Oldest cache entry  <1m")
 	assertContains(t, got, "Live runs           0 active, 0 inactive")
 	assertContains(t, got, "Original output size")
-	assertContains(t, got, "Compressed cache blobs")
+	assertContains(t, got, "Stored cache blobs")
 	assertContains(t, got, "Blob max usage")
 	assertContains(t, got, "Retained go-list files")
 	assertContains(t, got, "Total stored")
 	assertContains(t, got, "Blob-only savings")
 	assertContains(t, got, "Overall savings")
-	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Blob contents:")
 	assertContains(t, got, "Text files      1        4B")
 }
 
@@ -3673,7 +3855,7 @@ func TestRunStatusActiveCache(t *testing.T) {
 	assertContains(t, got, "Cached actions      1")
 	assertContains(t, got, "Cached outputs      1")
 	assertContains(t, got, "Live runs           1 active, 0 inactive")
-	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Blob contents:")
 	assertContains(t, got, "Text files      1        4B")
 }
 
@@ -3723,7 +3905,7 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Blob contents:")
 	assertContains(t, got, "Go package archives")
 	assertContains(t, got, "Go indexed export data")
 	assertContains(t, got, "Go package indexes")
@@ -3812,7 +3994,7 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stdout.String()
-	assertContains(t, got, "Compressed blob contents:")
+	assertContains(t, got, "Blob contents:")
 	assertContains(t, got, "Unreadable blobs      1        4B")
 }
 
@@ -4205,13 +4387,20 @@ func TestReopenCacheReordersOutputCoverIndex(t *testing.T) {
 	if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		return sqlitex.ExecuteScript(conn, `
 DROP INDEX entries_output_cover;
+ALTER TABLE entries DROP COLUMN raw;
 CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version);
+PRAGMA user_version = 1;
 `, nil)
 	}); err != nil {
 		st.close()
 		t.Fatal(err)
 	}
 	st.close()
+
+	status, err := readStatus(cfg)
+	if err != nil || status.catalog.entries != 1 || status.catalog.compressedSize != original.CompressedSize {
+		t.Fatalf("status before migration = %+v, err = %v", status.catalog, err)
+	}
 
 	for attempt := range 2 {
 		st, err := newStore(cfg)
@@ -4232,8 +4421,8 @@ CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, b
 			}
 			var version, blobType, blobVersion, retainedType, retainedVersion int64
 			queryDB(t, st.db, `PRAGMA user_version`, nil, &version)
-			if version != 1 {
-				t.Fatalf("catalog version = %d, want existing version 1", version)
+			if version != cacheSchemaVersion {
+				t.Fatalf("catalog version = %d, want %d", version, cacheSchemaVersion)
 			}
 			queryDB(t, st.db, `SELECT blob_type, blob_type_version, retained_type, retained_type_version FROM entries`, nil,
 				&blobType, &blobVersion, &retainedType, &retainedVersion)
@@ -4242,7 +4431,7 @@ CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, b
 			}
 			var columns string
 			queryDB(t, st.db, `SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno)`, nil, &columns)
-			if want := "output_id,compressed_size,size,blob_type,blob_type_version,retained_type,retained_type_version"; columns != want {
+			if want := "output_id,compressed_size,size,blob_type,blob_type_version,retained_type,retained_type_version,raw"; columns != want {
 				t.Fatalf("covering index columns = %q, want %q", columns, want)
 			}
 			if attempt == 0 {

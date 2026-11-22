@@ -1,9 +1,9 @@
 # gocachez
 
 `gocachez` is a [`GOCACHEPROG`](https://pkg.go.dev/cmd/go/internal/cacheprog)
-helper for the Go build cache. It stores cache artifacts as zstd-compressed
-files, materializes uncompressed files for the Go command on demand, and evicts
-old compressed entries automatically.
+helper for the Go build cache. It generally stores cache artifacts as
+zstd-compressed files, materializes uncompressed files for the Go command on
+demand, and evicts old entries automatically.
 
 This project was inspired by the discussion on
 [`golang/go#76337`](https://github.com/golang/go/issues/76337).
@@ -91,6 +91,19 @@ On `get`, `gocachez` looks up the action ID in SQLite. On a hit, it opens the
 compressed blob, decompresses it into the current run's `live/` directory, and
 returns the materialized path as `DiskPath`.
 
+After a cache hit on a compressed blob of at least 32 MiB uncompressed,
+`gocachez` can replace it with the full uncompressed artifact at shutdown. This
+happens when no other helper is active and the cache has room for the larger
+file. Subsequent hits hardlink the artifact into the current run, with a
+file-copy fallback on filesystems that do not support hardlinks. Both formats
+use the same size and age limits. The cache periodically removes unpublished
+files and superseded representations.
+
+Existing compressed caches upgrade in place and retain their entries. Older
+versions of `gocachez` cannot use the upgraded catalog. To downgrade, use a
+different cache directory or run `gocachez clean` with the newer version after
+active Go commands have finished.
+
 Live files are removed when the `GOCACHEPROG` process closes. If `gocachez`
 exits abnormally, a later run can safely clean up abandoned live files: each run
 holds an OS file lock, and another process only reclaims a run directory after
@@ -155,7 +168,7 @@ Supported options:
 - Flag: `-dir`
 - Default: `os.UserCacheDir()/gocachez`
 
-**Maximum compressed cache size**
+**Maximum total blob storage**
 
 - Config: `maxSize`
 - Environment: `GOCACHEZ_MAX_SIZE`
